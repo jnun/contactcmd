@@ -8,7 +8,7 @@
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, search_messages, run_messages, LastMessage};
+pub use macos::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage};
 
 #[cfg(not(target_os = "macos"))]
 mod stub {
@@ -43,17 +43,12 @@ mod stub {
         Ok(vec![])
     }
 
-    /// Stub implementation for non-macOS platforms - always returns empty
-    pub fn search_messages(_terms: &[&str], _limit: u32) -> Result<Vec<LastMessage>> {
-        Ok(vec![])
-    }
-
     /// Stub implementation for non-macOS platforms
-    pub fn run_messages(_db: &crate::db::Database, _query: &str) -> Result<()> {
+    pub fn run_messages(_db: &crate::db::Database, _query: &str, _since: Option<&str>) -> Result<()> {
         println!("Messages search is only available on macOS.");
         Ok(())
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, search_messages, run_messages, LastMessage};
+pub use stub::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage};

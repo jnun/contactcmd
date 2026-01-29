@@ -5,6 +5,9 @@ use crate::cli::ui::{is_valid_email, minimal_render_config, prompt_field_optiona
 use crate::db::Database;
 use crate::models::{Email, Person, Phone};
 
+/// Contact input fields: (first, last, email, phone, notes)
+type ContactInput = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+
 /// Execute the add command
 pub fn run_add(
     db: &Database,
@@ -81,7 +84,7 @@ pub fn run_add(
     Ok(())
 }
 
-fn interactive_mode() -> Result<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> {
+fn interactive_mode() -> Result<ContactInput> {
     let first = match prompt_field_optional("first")? {
         FormResult::Value(v) => if v.is_empty() { None } else { Some(v) },
         FormResult::Cancelled => {

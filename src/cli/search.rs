@@ -189,9 +189,7 @@ fn run_search_review_mode(db: &Database, results: &[Person], _query: &str) -> Re
                 index += 1;
             }
             KeyCode::Left | KeyCode::Char('p') | KeyCode::Char('P') => {
-                if index > 0 {
-                    index -= 1;
-                }
+                index = index.saturating_sub(1);
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 break;

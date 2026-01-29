@@ -43,7 +43,7 @@ impl NameOrder {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "eastern" => Self::Eastern,
             "latin" => Self::Latin,
@@ -72,7 +72,7 @@ impl PersonType {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "business" => Self::Business,
             "prospect" => Self::Prospect,

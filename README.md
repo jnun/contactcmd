@@ -33,11 +33,8 @@ contactcmd show "John Smith"
 # Add a new contact
 contactcmd add -f John -l Smith -e john@example.com -p 555-1234
 
-# Update a contact
-contactcmd update "John Smith" -e newemail@example.com
-
-# Delete a contact
-contactcmd delete "John Smith"
+# Search iMessage history
+contactcmd messages "lunch"
 ```
 
 ## Commands
@@ -73,17 +70,10 @@ contactcmd add -f John -l Smith     # Direct mode with options
 contactcmd add -f John -e j@x.com -p 555-1234 -n "Met at conference"
 ```
 
-### update
+### messages
 ```bash
-contactcmd update "John Smith" -f Johnny           # Update first name
-contactcmd update "John Smith" -e new@example.com  # Update email
-contactcmd update a5f2ea15-... -n "New notes"      # Update by UUID
-```
-
-### delete
-```bash
-contactcmd delete "John Smith"      # Delete with confirmation
-contactcmd delete "John Smith" -f   # Force delete (no confirmation)
+contactcmd messages "lunch"                # Search full iMessage history
+contactcmd messages "project" --since 2024-01-01  # With date filter
 ```
 
 ### sync
@@ -136,15 +126,14 @@ SQLite database at `~/.config/contactcmd/contacts.db`
 | search command | Complete |
 | show command | Complete |
 | add command | Complete |
-| update command | Complete |
-| delete command | Complete |
+| messages command | Complete |
 | macOS sync | Complete |
 
 ## Development
 
 ```bash
 cargo build          # Build
-cargo test           # Run tests (51 tests)
+cargo test           # Run tests (76 tests)
 cargo run -- --help  # Run in development
 ```
 

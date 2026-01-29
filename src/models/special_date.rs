@@ -19,7 +19,7 @@ impl DateType {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "anniversary" => Self::Anniversary,
             "custom" => Self::Custom,

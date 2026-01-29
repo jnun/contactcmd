@@ -7,19 +7,17 @@ use inquire::{Select, Text};
 use std::io::{self, IsTerminal};
 
 use crate::cli::ui::{clear_screen, minimal_render_config};
-use crate::cli::{run_add, run_cleanup, run_delete, run_list, run_messages, run_note, run_search, run_show, run_sync};
+use crate::cli::{run_add, run_browse_mode, run_cleanup, run_list, run_messages, run_search, run_show, run_sync};
 use crate::db::Database;
 
 /// Menu options with type-safe variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuOption {
+    Browse,
     List,
     Search,
     Show,
     Add,
-    Note,
-    Update,
-    Delete,
     MissingEmail,
     MissingPhone,
     Cleanup,
@@ -30,13 +28,11 @@ enum MenuOption {
 
 impl MenuOption {
     const ALL: &'static [MenuOption] = &[
+        MenuOption::Browse,
         MenuOption::List,
         MenuOption::Search,
         MenuOption::Show,
         MenuOption::Add,
-        MenuOption::Note,
-        MenuOption::Update,
-        MenuOption::Delete,
         MenuOption::MissingEmail,
         MenuOption::MissingPhone,
         MenuOption::Cleanup,
@@ -47,13 +43,11 @@ impl MenuOption {
 
     fn label(self) -> &'static str {
         match self {
+            MenuOption::Browse => "Browse",
             MenuOption::List => "List",
             MenuOption::Search => "Search",
             MenuOption::Show => "Show",
             MenuOption::Add => "Add",
-            MenuOption::Note => "Note",
-            MenuOption::Update => "Update",
-            MenuOption::Delete => "Delete",
             MenuOption::MissingEmail => "Missing Email",
             MenuOption::MissingPhone => "Missing Phone",
             MenuOption::Cleanup => "Cleanup",
@@ -134,6 +128,10 @@ pub fn run_menu(db: &Database) -> Result<()> {
 /// Returns Ok(true) if the user wants to quit the app
 fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
     match choice {
+        MenuOption::Browse => {
+            let persons = db.list_persons(10000, 0)?;
+            run_browse_mode(db, persons).map(|_| false)
+        }
         MenuOption::List => {
             run_list(db, 1, 0, None, "asc".into(), false, false).map(|_| false)
         }
@@ -155,27 +153,6 @@ fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
         }
         MenuOption::Add => {
             run_add(db, None, None, None, None, None).map(|_| false)
-        }
-        MenuOption::Note => {
-            let name = prompt_for_input("name: ")?;
-            if name.is_empty() {
-                return Ok(false);
-            }
-            run_note(db, &name, None).map(|_| false)
-        }
-        MenuOption::Update => {
-            let name = prompt_for_input("name: ")?;
-            if name.is_empty() {
-                return Ok(false);
-            }
-            run_show(db, &name)
-        }
-        MenuOption::Delete => {
-            let name = prompt_for_input("name: ")?;
-            if name.is_empty() {
-                return Ok(false);
-            }
-            run_delete(db, &name, false).map(|_| false)
         }
         MenuOption::MissingEmail => {
             run_search(db, "", false, Some("email")).map(|_| false)
@@ -200,7 +177,7 @@ fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
             if query.is_empty() {
                 return Ok(false);
             }
-            run_messages(db, &query).map(|_| false)
+            run_messages(db, &query, None).map(|_| false)
         }
         MenuOption::Quit => Ok(true),
     }
@@ -255,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_menu_option_all_has_correct_count() {
-        assert_eq!(MenuOption::ALL.len(), 13);
+        assert_eq!(MenuOption::ALL.len(), 11);
     }
 
     #[test]

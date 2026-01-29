@@ -85,7 +85,7 @@ fn apple_timestamp_to_datetime(timestamp: i64) -> DateTime<Local> {
     Utc.timestamp_opt(seconds, 0)
         .single()
         .map(|dt| dt.with_timezone(&Local))
-        .unwrap_or_else(|| Local::now())
+        .unwrap_or_else(Local::now)
 }
 
 /// Known NSClass names to filter out when extracting text from attributedBody blobs
@@ -136,12 +136,10 @@ pub fn extract_text_from_body(blob: &[u8]) -> Option<String> {
 
     for &byte in blob {
         // Accept printable ASCII range plus common extended chars
-        if byte >= 0x20 && byte < 0x7F {
+        if (0x20..0x7F).contains(&byte) {
             current.push(byte as char);
-        } else {
-            if !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
-            }
+        } else if !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
         }
     }
     if !current.is_empty() {
@@ -526,8 +524,11 @@ pub fn get_messages_for_handles(phones: &[String], emails: &[String], limit: u32
     Ok(messages)
 }
 
-/// Search recent messages for terms (case-insensitive AND match on all terms)
-pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
+/// Search messages using SQL LIKE for full database coverage
+///
+/// Queries the full Messages database with SQL filtering instead of loading
+/// into memory. Supports date filtering via `since_date` (YYYY-MM-DD format).
+pub fn search_messages(terms: &[&str], limit: u32, since_date: Option<&str>) -> Result<Vec<LastMessage>> {
     if terms.is_empty() {
         return Ok(vec![]);
     }
@@ -537,15 +538,34 @@ pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
         None => return Ok(vec![]),
     };
 
-    let query = r#"
-        SELECT m.text, m.attributedBody, m.date, m.is_from_me, h.id
-        FROM message m
-        INNER JOIN handle h ON m.handle_id = h.ROWID
-        ORDER BY m.date DESC
-        LIMIT 5000
-    "#;
+    // Build SQL WHERE clause:
+    // - Messages where text matches ALL terms (SQL-optimized path)
+    // - OR messages where text is NULL (need post-processing for attributedBody)
+    let text_likes: Vec<String> = terms
+        .iter()
+        .map(|_| "m.text LIKE ?".to_string())
+        .collect();
+    let text_filter = format!("(({}) OR m.text IS NULL)", text_likes.join(" AND "));
 
-    let mut stmt = match conn.prepare(query) {
+    let mut where_clauses = vec![text_filter];
+
+    // Add date filter if provided
+    let since_timestamp = since_date.and_then(parse_date_to_apple_timestamp);
+    if since_timestamp.is_some() {
+        where_clauses.push("m.date >= ?".to_string());
+    }
+
+    let query = format!(
+        r#"SELECT m.text, m.attributedBody, m.date, m.is_from_me, h.id
+           FROM message m
+           INNER JOIN handle h ON m.handle_id = h.ROWID
+           WHERE {}
+           ORDER BY m.date DESC
+           LIMIT ?"#,
+        where_clauses.join(" AND ")
+    );
+
+    let mut stmt = match conn.prepare(&query) {
         Ok(s) => s,
         Err(e) => {
             let err_str = e.to_string().to_lowercase();
@@ -556,7 +576,20 @@ pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
         }
     };
 
-    let rows = stmt.query_map([], |row| {
+    // Build params: %term% patterns + optional since_timestamp + limit
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = terms
+        .iter()
+        .map(|t| Box::new(format!("%{}%", t)) as Box<dyn rusqlite::ToSql>)
+        .collect();
+
+    if let Some(ts) = since_timestamp {
+        params.push(Box::new(ts));
+    }
+    params.push(Box::new(limit));
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok((
             row.get::<_, Option<String>>(0)?,
             row.get::<_, Option<Vec<u8>>>(1)?,
@@ -570,10 +603,6 @@ pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
     let mut results = Vec::new();
 
     for row_result in rows {
-        if results.len() >= limit as usize {
-            break;
-        }
-
         let (text, attributed_body, date, is_from_me, handle) = match row_result {
             Ok(r) => r,
             Err(_) => continue,
@@ -584,6 +613,8 @@ pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
             None => continue,
         };
 
+        // Double-check term matching (SQL LIKE is case-insensitive on text column,
+        // but we may have extracted from attributedBody)
         let text_lower = msg_text.to_lowercase();
         let all_match = lower_terms.iter().all(|term| text_lower.contains(term.as_str()));
 
@@ -598,6 +629,22 @@ pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
     }
 
     Ok(results)
+}
+
+/// Parse a YYYY-MM-DD date string to Apple timestamp (nanoseconds since 2001-01-01)
+fn parse_date_to_apple_timestamp(date_str: &str) -> Option<i64> {
+    use chrono::NaiveDate;
+
+    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+    let datetime = date.and_hms_opt(0, 0, 0)?;
+
+    // Convert to Unix timestamp then to Apple timestamp
+    let unix_ts = datetime.and_utc().timestamp();
+    const APPLE_EPOCH_OFFSET: i64 = 978307200; // seconds from 1970 to 2001
+    let apple_seconds = unix_ts - APPLE_EPOCH_OFFSET;
+
+    // Return in nanoseconds (modern Messages format)
+    Some(apple_seconds * 1_000_000_000)
 }
 
 /// A group of messages from a single handle, with resolved contact info
@@ -678,25 +725,28 @@ impl Drop for RawModeGuard {
 }
 
 /// Run the messages search command with interactive review-style navigation
-pub fn run_messages(db: &Database, query: &str) -> Result<()> {
+pub fn run_messages(db: &Database, query: &str, since: Option<&str>) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEvent};
     use crate::cli::ui::clear_screen;
 
     let words: Vec<&str> = query.split_whitespace().collect();
     if words.is_empty() {
-        println!("Usage: contactcmd messages \"search terms\"");
+        println!("Usage: contactcmd messages \"search terms\" [--since YYYY-MM-DD]");
         return Ok(());
     }
 
     // Keep lowercase search terms for snippet centering
     let search_terms: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
 
-    let results = search_messages(&words, 200)?;
+    // Search full history with high limit (10000)
+    let results = search_messages(&words, 10000, since)?;
 
     if results.is_empty() {
-        println!("No messages.");
+        println!("No messages found matching \"{}\".", query);
         return Ok(());
     }
+
+    let total_matches = results.len();
 
     // Group results by handle, preserving insertion order
     let mut handle_order: Vec<String> = Vec::new();
@@ -742,8 +792,12 @@ pub fn run_messages(db: &Database, query: &str) -> Result<()> {
 
         clear_screen()?;
 
-        // Header
-        println!("Messages: {}\n", group.contact_name);
+        // Header with total match count
+        println!("Messages: {} ({} matches across {} contacts)\n",
+            group.contact_name,
+            total_matches,
+            groups.len()
+        );
 
         // Subheader: location and handle
         let loc = group.location.as_deref().unwrap_or("");
@@ -825,9 +879,9 @@ pub fn run_messages(db: &Database, query: &str) -> Result<()> {
                 if selected > 0 {
                     // Move selection up within visible window
                     selected -= 1;
-                } else if scroll > 0 {
+                } else {
                     // Scroll up and keep selection at top
-                    scroll -= 1;
+                    scroll = scroll.saturating_sub(1);
                 }
             }
             KeyCode::Enter => {

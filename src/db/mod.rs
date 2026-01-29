@@ -22,6 +22,9 @@ impl Database {
         // Create parent directories
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Also create photos directory
+            let photos_dir = parent.join("photos");
+            std::fs::create_dir_all(&photos_dir)?;
         }
 
         let conn = Connection::open(&path)?;
@@ -30,6 +33,13 @@ impl Database {
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Get the path to the photos directory
+    pub fn photos_dir() -> Result<PathBuf> {
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
+        Ok(config_dir.join("contactcmd").join("photos"))
     }
 
     /// Open in-memory database for testing
@@ -63,6 +73,53 @@ impl Database {
             self.set_schema_version(1)?;
         }
 
+        if self.get_schema_version()? == 1 {
+            // V1 → V2: Add photo_path column
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V2))?;
+            self.set_schema_version(2)?;
+        }
+
+        if self.get_schema_version()? == 2 {
+            // V2 → V3: Drop photo_path column (photos now derived from UUID)
+            self.migrate_v3()?;
+            self.set_schema_version(3)?;
+        }
+
+        Ok(())
+    }
+
+    /// V3 migration: Drop photo_path column
+    /// Tries DROP COLUMN first (SQLite 3.35.0+), falls back to table rebuild
+    fn migrate_v3(&self) -> Result<()> {
+        // First, check if photo_path column exists (it might not on fresh V3 installs)
+        let has_photo_path = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('persons') WHERE name = 'photo_path'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )? > 0;
+
+        if !has_photo_path {
+            // Column doesn't exist, nothing to do
+            return Ok(());
+        }
+
+        // Try DROP COLUMN first (SQLite 3.35.0+)
+        let drop_result = self.conn.execute_batch(&format!(
+            "BEGIN TRANSACTION; {} COMMIT;",
+            schema::MIGRATION_V3_DROP_COLUMN
+        ));
+
+        if drop_result.is_ok() {
+            return Ok(());
+        }
+
+        // Fallback: rebuild table
+        self.conn.execute_batch(&format!(
+            "BEGIN TRANSACTION; {} COMMIT;",
+            schema::MIGRATION_V3_REBUILD
+        ))?;
+
         Ok(())
     }
 
@@ -79,7 +136,7 @@ impl Database {
             Err(rusqlite::Error::SqliteFailure(err, msg)) => {
                 // "no such table" is error code 1 (SQLITE_ERROR)
                 if err.code == rusqlite::ErrorCode::Unknown
-                    && msg.as_ref().map_or(false, |m| m.contains("no such table"))
+                    && msg.as_ref().is_some_and(|m| m.contains("no such table"))
                 {
                     Ok(0)
                 } else {
@@ -106,7 +163,7 @@ mod tests {
     #[test]
     fn test_open_memory() {
         let db = Database::open_memory().unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 1);
+        assert_eq!(db.get_schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

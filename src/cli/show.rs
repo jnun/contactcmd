@@ -3,6 +3,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use inquire::Text;
 use std::io::{self, Write};
 use uuid::Uuid;
 
@@ -12,7 +13,7 @@ use super::display::print_full_contact;
 use super::list::{handle_edit, handle_edit_all, handle_notes};
 use super::display::format_message_date;
 use super::messages::{get_last_message_for_handles, get_messages_for_handles};
-use super::ui::{clear_screen, select_contact, visible_lines};
+use super::ui::{clear_screen, minimal_render_config, select_contact, visible_lines};
 #[cfg(target_os = "macos")]
 use super::sync::{delete_from_macos_contacts, get_apple_id};
 
@@ -197,22 +198,56 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
         .collect();
 
     let messages = get_messages_for_handles(&phones, &emails, 50)?;
+    let display_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
+    let can_send = get_send_address(detail).is_some();
 
     if messages.is_empty() {
         clear_screen()?;
         println!("No messages for this contact.\n");
-        print!("[enter] to go back: ");
+
+        if can_send {
+            print!("[s]end [enter] back: ");
+        } else {
+            print!("[enter] back: ");
+        }
         io::stdout().flush()?;
 
-        // Wait for key press before returning
-        let _action = {
-            let _guard = RawModeGuard::new()?;
-            event::read()?
-        };
-        return Ok(false);
+        // Wait for key press
+        loop {
+            let action = {
+                let _guard = RawModeGuard::new()?;
+                match event::read()? {
+                    Event::Key(KeyEvent { code, .. }) => code,
+                    _ => continue,
+                }
+            };
+
+            match action {
+                KeyCode::Char('s') | KeyCode::Char('S') if can_send => {
+                    if let Some(addr) = get_send_address(detail) {
+                        match compose_and_send(&addr, display_name)? {
+                            SendResult::Sent => {
+                                // Return to refresh messages (will show the new message)
+                                return show_messages_screen(_db, detail);
+                            }
+                            SendResult::Cancelled => {
+                                return show_messages_screen(_db, detail);
+                            }
+                            SendResult::Error(msg) => {
+                                show_send_error(&msg)?;
+                                return show_messages_screen(_db, detail);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
     }
 
-    let display_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
     let total_msgs = messages.len();
     let mut selected: usize = 0;
 
@@ -246,7 +281,12 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
             println!("{} {} {} \"{}\"", marker, direction, date_str, text);
         }
 
-        print!("\n{}/{}  [↑/↓] select [enter] view [q]uit", selected + 1, total_msgs);
+        // Footer with send option if contact has phone/email
+        if can_send {
+            print!("\n{}/{}  [↑/↓] select [enter] view [s]end [q]uit", selected + 1, total_msgs);
+        } else {
+            print!("\n{}/{}  [↑/↓] select [enter] view [q]uit", selected + 1, total_msgs);
+        }
         io::stdout().flush()?;
 
         // Read key
@@ -265,17 +305,31 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if selected > 0 {
-                    selected -= 1;
-                }
+                selected = selected.saturating_sub(1);
             }
             KeyCode::Enter => {
                 if show_full_message(&messages[selected], display_name)? {
                     return Ok(true); // Propagate quit
                 }
             }
+            KeyCode::Char('s') | KeyCode::Char('S') if can_send => {
+                if let Some(addr) = get_send_address(detail) {
+                    match compose_and_send(&addr, display_name)? {
+                        SendResult::Sent => {
+                            // Return to refresh messages (will show the sent message)
+                            return show_messages_screen(_db, detail);
+                        }
+                        SendResult::Cancelled => {
+                            // Just continue showing messages
+                        }
+                        SendResult::Error(msg) => {
+                            show_send_error(&msg)?;
+                        }
+                    }
+                }
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                return Ok(true); // Quit
+                return Ok(false); // Return to contact card
             }
             _ => {}
         }
@@ -326,6 +380,174 @@ fn run_selection_menu(db: &Database, results: &[Person], _query: &str) -> Result
         return show_person_detail(db, &person);
     }
     Ok(false)
+}
+
+// ==================== iMessage Send Functions ====================
+
+/// Result of attempting to send a message
+enum SendResult {
+    Sent,
+    Cancelled,
+    Error(String),
+}
+
+/// Get the best address to send a message to (phone preferred, email fallback)
+fn get_send_address(detail: &ContactDetail) -> Option<String> {
+    // Prefer phone number (works for both iMessage and SMS)
+    if let Some(phone) = detail.phones.first() {
+        return Some(phone.phone_number.clone());
+    }
+    // Fall back to email (iMessage only)
+    if let Some(email) = detail.emails.first() {
+        return Some(email.email_address.clone());
+    }
+    None
+}
+
+/// Show compose screen and send message
+/// Returns SendResult indicating outcome
+fn compose_and_send(recipient: &str, display_name: &str) -> Result<SendResult> {
+    clear_screen()?;
+
+    println!("To: {} ({})\n", display_name, recipient);
+
+    let message = Text::new("message:")
+        .with_render_config(minimal_render_config())
+        .prompt_skippable()?;
+
+    let Some(message) = message else {
+        return Ok(SendResult::Cancelled);
+    };
+
+    if message.trim().is_empty() {
+        return Ok(SendResult::Cancelled);
+    }
+
+    print!("Sending...");
+    io::stdout().flush()?;
+
+    match send_imessage(recipient, &message) {
+        Ok(()) => {
+            println!(" Sent.");
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            Ok(SendResult::Sent)
+        }
+        Err(e) => Ok(SendResult::Error(e.to_string())),
+    }
+}
+
+/// Send a message via AppleScript (supports both iMessage and SMS)
+#[cfg(target_os = "macos")]
+fn send_imessage(recipient: &str, message: &str) -> Result<()> {
+    use std::process::Command;
+
+    // Escape message for AppleScript
+    let escaped_message = message.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_recipient = recipient.replace('\\', "\\\\").replace('"', "\\\"");
+
+    // Determine if this looks like a phone number (for SMS) or email (for iMessage)
+    let is_phone = recipient.chars().any(|c| c.is_ascii_digit())
+        && !recipient.contains('@');
+
+    // For phone numbers, try SMS first (works for Android via iPhone relay),
+    // then fall back to iMessage. For emails, use iMessage only.
+    let script = if is_phone {
+        format!(
+            r#"
+            tell application "Messages"
+                -- Try SMS first (for Android users via iPhone relay)
+                try
+                    set smsService to 1st account whose service type = SMS
+                    set targetBuddy to participant "{0}" of smsService
+                    send "{1}" to targetBuddy
+                    return "sent"
+                end try
+
+                -- Fall back to iMessage
+                try
+                    set imsgService to 1st account whose service type = iMessage
+                    set targetBuddy to participant "{0}" of imsgService
+                    send "{1}" to targetBuddy
+                    return "sent"
+                end try
+
+                error "Could not find SMS or iMessage service"
+            end tell
+            "#,
+            escaped_recipient, escaped_message
+        )
+    } else {
+        // Email addresses use iMessage only
+        format!(
+            r#"
+            tell application "Messages"
+                set imsgService to 1st account whose service type = iMessage
+                set targetBuddy to participant "{}" of imsgService
+                send "{}" to targetBuddy
+            end tell
+            "#,
+            escaped_recipient, escaped_message
+        )
+    };
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_lower = stderr.to_lowercase();
+
+        if stderr_lower.contains("not authorized") || stderr_lower.contains("assistive access") {
+            anyhow::bail!(
+                "Permission required.\n\n\
+                Grant access in: System Settings > Privacy & Security > Accessibility\n\
+                Add your terminal app (Terminal, iTerm, etc.) to the list."
+            );
+        }
+        if stderr_lower.contains("can't get account") || stderr_lower.contains("no account") {
+            if is_phone {
+                anyhow::bail!(
+                    "No SMS or iMessage service available.\n\n\
+                    For SMS: Connect your iPhone and enable Settings > Messages > Text Message Forwarding.\n\
+                    For iMessage: Open Messages.app and sign in with your Apple ID."
+                );
+            } else {
+                anyhow::bail!(
+                    "Messages.app is not set up.\n\n\
+                    Open Messages.app and sign in with your Apple ID first."
+                );
+            }
+        }
+        anyhow::bail!("Send failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Stub for non-macOS platforms
+#[cfg(not(target_os = "macos"))]
+fn send_imessage(_recipient: &str, _message: &str) -> Result<()> {
+    anyhow::bail!("Sending messages is only available on macOS.")
+}
+
+/// Show an error message and wait for keypress
+fn show_send_error(message: &str) -> Result<()> {
+    clear_screen()?;
+    println!("Error: {}\n", message);
+    print!("[enter] to continue");
+    io::stdout().flush()?;
+
+    let _guard = RawModeGuard::new()?;
+    loop {
+        if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+            if matches!(code, KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc) {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

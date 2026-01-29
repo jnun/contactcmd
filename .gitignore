@@ -102,6 +102,17 @@ docs/data/*.json
 docs/data/*.xml
 docs/data/*.sql
 
+# Photos/images (contact photos stored in ~/.config, but safety net)
+photos/
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.gif
+*.webp
+!docs/**/*.png
+!docs/**/*.jpg
+
 # Design files (binary/large files)
 docs/designs/*.psd
 docs/designs/*.ai

@@ -1,5 +1,5 @@
 use clap::Parser;
-use contactcmd::cli::{run_add, run_delete, run_list, run_menu, run_messages, run_note, run_search, run_show, run_sync, run_update, Cli, Commands};
+use contactcmd::cli::{run_add, run_browse_mode, run_list, run_menu, run_messages, run_photo, run_search, run_show, run_sync, Cli, Commands};
 use contactcmd::db::Database;
 
 fn main() -> anyhow::Result<()> {
@@ -14,6 +14,19 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::List(args)) => {
             run_list(&db, args.page, args.limit, args.sort, args.order, args.all, args.review)?;
         }
+        Some(Commands::Browse(args)) => {
+            let persons = if args.missing_email {
+                db.find_persons_missing_email(10000)?
+            } else if args.missing_phone {
+                db.find_persons_missing_phone(10000)?
+            } else if let Some(ref query) = args.search {
+                let words: Vec<&str> = query.split_whitespace().collect();
+                db.search_persons_multi(&words, false, 10000)?
+            } else {
+                db.list_persons(10000, 0)?
+            };
+            run_browse_mode(&db, persons)?;
+        }
         Some(Commands::Search(args)) => {
             run_search(&db, &args.query, args.case_sensitive, args.missing.as_deref())?;
         }
@@ -23,25 +36,14 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Add(args)) => {
             run_add(&db, args.first, args.last, args.email, args.phone, args.notes)?;
         }
-        Some(Commands::Update(args)) => {
-            run_update(&db, &args.identifier, args.first, args.last, args.email, args.phone, args.notes)?;
-        }
-        Some(Commands::Delete(args)) => {
-            run_delete(&db, &args.identifier, args.force)?;
-        }
-        Some(Commands::Note(args)) => {
-            let note_text = if args.note.is_empty() {
-                None
-            } else {
-                Some(args.note.join(" "))
-            };
-            run_note(&db, &args.search, note_text)?;
-        }
         Some(Commands::Sync(args)) => {
             run_sync(&db, &args.source, args.dry_run)?;
         }
         Some(Commands::Messages(args)) => {
-            run_messages(&db, &args.query)?;
+            run_messages(&db, &args.query, args.since.as_deref())?;
+        }
+        Some(Commands::Photo(args)) => {
+            run_photo(&db, &args.identifier, args.path.as_deref(), args.clear)?;
         }
     }
 

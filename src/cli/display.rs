@@ -1,6 +1,29 @@
 use crate::models::ContactDetail;
 use super::messages::LastMessage;
+use super::photo_utils;
 use chrono::{Datelike, Local, Timelike};
+use uuid::Uuid;
+
+/// Display a contact photo if available (derived from person UUID)
+fn display_photo(person_id: Uuid) {
+    if !photo_utils::photo_exists(person_id) {
+        return;
+    }
+
+    let full_path = match photo_utils::photo_path(person_id) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let conf = viuer::Config {
+        width: Some(24),
+        height: Some(12),
+        ..Default::default()
+    };
+
+    // Ignore errors - graceful fallback if terminal doesn't support images
+    let _ = viuer::print_from_file(&full_path, &conf);
+}
 
 /// Print a full contact detail with clean formatting (only non-empty fields)
 pub fn print_full_contact(detail: &ContactDetail, last_message: Option<&LastMessage>) {
@@ -9,6 +32,9 @@ pub fn print_full_contact(detail: &ContactDetail, last_message: Option<&LastMess
         .display_name
         .as_deref()
         .unwrap_or("(unnamed)");
+
+    // Photo (if available)
+    display_photo(person.id);
 
     // Header - just the name
     println!("{}\n", display_name);

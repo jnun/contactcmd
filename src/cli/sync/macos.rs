@@ -9,7 +9,7 @@ use objc2::runtime::Bool;
 use objc2::Message;
 use objc2_contacts::{
     CNContact, CNContactEmailAddressesKey, CNContactFamilyNameKey,
-    CNContactGivenNameKey, CNContactIdentifierKey,
+    CNContactGivenNameKey, CNContactIdentifierKey, CNContactImageDataKey,
     CNContactJobTitleKey, CNContactMiddleNameKey, CNContactNamePrefixKey,
     CNContactNameSuffixKey, CNContactNicknameKey, CNContactOrganizationNameKey,
     CNContactPhoneNumbersKey, CNContactPostalAddressesKey, CNContactBirthdayKey,
@@ -19,6 +19,7 @@ use objc2_contacts::{
 };
 use objc2_foundation::{NSArray, NSError, NSMutableCopying, NSString, NSPredicate};
 
+use crate::cli::photo_utils;
 use crate::db::Database;
 use crate::models::{
     Address, AddressType, DateType, Email, EmailType, Person, PersonOrganization,
@@ -133,6 +134,11 @@ pub fn run_sync_mac(db: &Database, dry_run: bool) -> Result<()> {
     } else {
         println!("Sync complete: {} created, {} updated, {} skipped",
                  created, updated, skipped);
+
+        // Offer to sync photos
+        if should_sync_photos() {
+            sync_photos(db, &contacts)?;
+        }
     }
 
     Ok(())
@@ -199,6 +205,7 @@ fn create_keys_array() -> Retained<NSArray<objc2::runtime::ProtocolObject<dyn CN
             CNContactPhoneNumbersKey,
             CNContactPostalAddressesKey,
             CNContactBirthdayKey,
+            CNContactImageDataKey,
         ];
 
         // Create an NSArray from the keys - they're protocol objects for CNKeyDescriptor
@@ -594,4 +601,83 @@ pub fn get_apple_id(person: &Person) -> Option<String> {
     let external_ids = person.external_ids.as_ref()?;
     let parsed: HashMap<String, String> = serde_json::from_str(external_ids).ok()?;
     parsed.get("apple").cloned()
+}
+
+/// Prompt user to sync photos
+fn should_sync_photos() -> bool {
+    use std::io::{self, Write};
+
+    print!("\nSync photos? [y/N]: ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Sync photos from macOS Contacts
+fn sync_photos(db: &Database, contacts: &NSArray<CNContact>) -> Result<()> {
+    let total = contacts.count();
+
+    println!("Syncing photos...");
+
+    let mut synced = 0;
+    let mut skipped = 0;
+
+    for i in 0..total {
+        let contact = contacts.objectAtIndex(i);
+        let apple_id = get_contact_identifier(&contact);
+
+        if apple_id.is_empty() {
+            continue;
+        }
+
+        // Get image data from contact
+        let image_data = unsafe { contact.imageData() };
+
+        let Some(data) = image_data else {
+            skipped += 1;
+            continue;
+        };
+
+        // Find the person in our database
+        let person = match db.find_person_by_external_id("apple", &apple_id)? {
+            Some(p) => p,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Convert NSData to Vec<u8>
+        let image_bytes = data.to_vec();
+
+        if image_bytes.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Save as JPEG (validates and converts)
+        if photo_utils::save_photo_bytes(person.id, &image_bytes).is_err() {
+            skipped += 1;
+            continue;
+        }
+
+        synced += 1;
+
+        // Progress indicator every 50 contacts
+        if synced % 50 == 0 {
+            eprint!("\rSyncing photos... {}", synced);
+        }
+    }
+
+    if synced >= 50 {
+        eprint!("\r                          \r"); // Clear progress line
+    }
+
+    println!("Photo sync complete: {} synced, {} without photos", synced, skipped);
+    Ok(())
 }

@@ -1,10 +1,14 @@
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, Row};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::Database;
 use crate::models::*;
+
+/// Display info for a person: (primary_email, location)
+pub type DisplayInfo = HashMap<Uuid, (Option<String>, Option<String>)>;
 
 /// Helper to convert UUID parse errors to rusqlite errors
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
@@ -451,8 +455,7 @@ impl Database {
     pub fn get_display_info_for_persons(
         &self,
         person_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, (Option<String>, Option<String>)>> {
-        use std::collections::HashMap;
+    ) -> Result<DisplayInfo> {
 
         if person_ids.is_empty() {
             return Ok(HashMap::new());
@@ -859,8 +862,8 @@ impl Database {
             display_name: row.get("display_name")?,
             sort_name: row.get("sort_name")?,
             search_name: row.get("search_name")?,
-            name_order: NameOrder::from_str(&name_order),
-            person_type: PersonType::from_str(&person_type),
+            name_order: NameOrder::parse(&name_order),
+            person_type: PersonType::parse(&person_type),
             notes: row.get("notes")?,
             is_active: row.get::<_, i32>("is_active")? == 1,
             created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
@@ -883,7 +886,7 @@ impl Database {
             id: parse_uuid(&id)?,
             person_id: parse_uuid(&person_id)?,
             email_address: row.get("email_address")?,
-            email_type: EmailType::from_str(&email_type_str.unwrap_or_default()),
+            email_type: EmailType::parse(&email_type_str.unwrap_or_default()),
             is_primary: row.get::<_, i32>("is_primary")? == 1,
         })
     }
@@ -897,7 +900,7 @@ impl Database {
             id: parse_uuid(&id)?,
             person_id: parse_uuid(&person_id)?,
             phone_number: row.get("phone_number")?,
-            phone_type: PhoneType::from_str(&phone_type_str.unwrap_or_default()),
+            phone_type: PhoneType::parse(&phone_type_str.unwrap_or_default()),
             is_primary: row.get::<_, i32>("is_primary")? == 1,
         })
     }
@@ -916,7 +919,7 @@ impl Database {
             state: row.get("state")?,
             postal_code: row.get("postal_code")?,
             country: row.get("country")?,
-            address_type: AddressType::from_str(&address_type_str.unwrap_or_default()),
+            address_type: AddressType::parse(&address_type_str.unwrap_or_default()),
             is_primary: row.get::<_, i32>("is_primary")? == 1,
         })
     }
@@ -939,7 +942,7 @@ impl Database {
                     id: parse_uuid(&id)?,
                     person_id: parse_uuid(&pid)?,
                     date: row.get(2)?,
-                    date_type: DateType::from_str(&date_type_str),
+                    date_type: DateType::parse(&date_type_str),
                     label: row.get(4)?,
                     year_known: row.get::<_, i32>(5)? == 1,
                 })
@@ -1013,7 +1016,7 @@ impl Database {
                 Ok(Interaction {
                     id: parse_uuid(&id)?,
                     person_id: parse_uuid(&pid)?,
-                    interaction_type: InteractionType::from_str(&interaction_type_str),
+                    interaction_type: InteractionType::parse(&interaction_type_str),
                     occurred_at: chrono::DateTime::parse_from_rfc3339(&occurred_at)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),

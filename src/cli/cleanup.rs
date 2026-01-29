@@ -116,7 +116,7 @@ pub fn run_cleanup(db: &Database) -> Result<()> {
 
         // Header
         println!("Incomplete Contacts (missing email & phone)\n");
-        println!("{:<40}  {}", "NAME", "NOTES");
+        println!("{:<40}  NOTES", "NAME");
 
         // Display visible rows
         let end = (scroll + visible).min(total);
@@ -188,9 +188,8 @@ pub fn run_cleanup(db: &Database) -> Result<()> {
                 // Mark ALL visible contacts on current page
                 let start = scroll;
                 let end_idx = (scroll + visible).min(total);
-                for i in start..end_idx {
-                    let person = contacts[i];
-                    marked_for_deletion.insert(person.id, person.clone());
+                for person in contacts.iter().take(end_idx).skip(start) {
+                    marked_for_deletion.insert(person.id, (*person).clone());
                 }
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
@@ -230,7 +229,7 @@ pub fn run_cleanup(db: &Database) -> Result<()> {
         // Collect all Apple IDs
         let apple_ids: Vec<String> = persons
             .iter()
-            .filter_map(|p| get_apple_id(p))
+            .filter_map(get_apple_id)
             .collect();
 
         let (succeeded, failed) = delete_from_macos_batch_with_retry(&apple_ids);

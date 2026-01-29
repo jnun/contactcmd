@@ -1,4 +1,54 @@
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 3;
+
+pub const MIGRATION_V2: &str = r#"
+ALTER TABLE persons ADD COLUMN photo_path TEXT;
+"#;
+
+/// V3 migration: Drop photo_path column (photos now derived from UUID)
+/// SQLite 3.35.0+ supports DROP COLUMN directly.
+/// For older versions, we rebuild the table.
+pub const MIGRATION_V3_DROP_COLUMN: &str = r#"
+ALTER TABLE persons DROP COLUMN photo_path;
+"#;
+
+/// Fallback for older SQLite: rebuild table without photo_path
+pub const MIGRATION_V3_REBUILD: &str = r#"
+CREATE TABLE persons_new (
+    id TEXT PRIMARY KEY,
+    name_given TEXT,
+    name_family TEXT,
+    name_middle TEXT,
+    name_prefix TEXT,
+    name_suffix TEXT,
+    name_nickname TEXT,
+    preferred_name TEXT,
+    display_name TEXT,
+    sort_name TEXT,
+    search_name TEXT,
+    name_order TEXT NOT NULL DEFAULT 'western',
+    person_type TEXT NOT NULL DEFAULT 'personal',
+    notes TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    is_dirty INTEGER NOT NULL DEFAULT 0,
+    external_ids TEXT
+);
+
+INSERT INTO persons_new SELECT
+    id, name_given, name_family, name_middle, name_prefix, name_suffix,
+    name_nickname, preferred_name, display_name, sort_name, search_name,
+    name_order, person_type, notes, is_active, created_at, updated_at,
+    is_dirty, external_ids
+FROM persons;
+
+DROP TABLE persons;
+ALTER TABLE persons_new RENAME TO persons;
+
+CREATE INDEX idx_person_search ON persons(search_name);
+CREATE INDEX idx_person_sort ON persons(sort_name);
+CREATE INDEX idx_person_active ON persons(is_active);
+"#;
 
 pub const SCHEMA_V1: &str = r#"
 -- Schema version tracking

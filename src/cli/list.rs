@@ -35,7 +35,7 @@ pub enum SortField {
 }
 
 impl SortField {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "name" => Some(Self::Name),
             "created" => Some(Self::Created),
@@ -61,7 +61,7 @@ pub enum SortOrder {
 }
 
 impl SortOrder {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "asc" => Some(Self::Asc),
             "desc" => Some(Self::Desc),
@@ -105,10 +105,10 @@ pub fn run_list(
 ) -> Result<()> {
     let sort_field = sort
         .as_deref()
-        .and_then(SortField::from_str)
+        .and_then(SortField::parse)
         .unwrap_or(SortField::Name);
 
-    let sort_order = SortOrder::from_str(&order).unwrap_or(SortOrder::Asc);
+    let sort_order = SortOrder::parse(&order).unwrap_or(SortOrder::Asc);
 
     let total = db.count_persons()?;
 
@@ -119,7 +119,13 @@ pub fn run_list(
 
     // Review mode - interactive one-by-one review
     if review {
-        return run_review_mode(db, sort_field, sort_order, total);
+        let persons = db.list_persons_sorted(
+            total,
+            0,
+            sort_field.to_sql_column(),
+            sort_order.to_sql(),
+        )?;
+        return run_browse_mode(db, persons);
     }
 
     // Use non-interactive mode if --all flag or not a TTY
@@ -142,7 +148,7 @@ pub fn run_list(
     };
 
     // Interactive paginated mode (only when stdout is a TTY)
-    let total_pages = (total + effective_limit - 1) / effective_limit;
+    let total_pages = total.div_ceil(effective_limit);
     let mut current_page = page.min(total_pages).max(1);
 
     run_interactive_list(
@@ -211,9 +217,7 @@ fn run_interactive_list(
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if cursor > 0 {
-                    cursor -= 1;
-                }
+                cursor = cursor.saturating_sub(1);
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
                 cursor = (cursor + visible).min(total as usize - 1);
@@ -289,18 +293,16 @@ fn print_table_header() {
     let layout = ColumnLayout::for_width(get_term_width());
     if layout.show_location {
         println!(
-            "{:<name_w$}  {:<contact_w$}  {}",
+            "{:<name_w$}  {:<contact_w$}  LOCATION",
             "NAME",
             "EMAIL/PHONE",
-            "LOCATION",
             name_w = layout.name_width,
             contact_w = layout.contact_width
         );
     } else {
         println!(
-            "{:<name_w$}  {}",
+            "{:<name_w$}  EMAIL/PHONE",
             "NAME",
-            "EMAIL/PHONE",
             name_w = layout.name_width
         );
     }
@@ -360,23 +362,15 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 // ============================================================================
-// Review Mode Implementation
+// Review/Browse Mode Implementation
 // ============================================================================
 
-/// Run the interactive review mode
-fn run_review_mode(
-    db: &Database,
-    sort_field: SortField,
-    sort_order: SortOrder,
-    total: u32,
-) -> Result<()> {
-    // Fetch all persons sorted
-    let persons = db.list_persons_sorted(
-        total,
-        0,
-        sort_field.to_sql_column(),
-        sort_order.to_sql(),
-    )?;
+/// Run the interactive browse/review mode with a pre-fetched list of persons
+pub fn run_browse_mode(db: &Database, persons: Vec<crate::models::Person>) -> Result<()> {
+    if persons.is_empty() {
+        println!("No contacts to browse.");
+        return Ok(());
+    }
 
     let mut index = 0;
 
@@ -456,9 +450,7 @@ fn run_review_mode(
                 index += 1;
             }
             KeyCode::Left => {
-                if index > 0 {
-                    index -= 1;
-                }
+                index = index.saturating_sub(1);
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 break;
@@ -958,22 +950,22 @@ mod tests {
 
     #[test]
     fn test_sort_field_from_str() {
-        assert!(matches!(SortField::from_str("name"), Some(SortField::Name)));
+        assert!(matches!(SortField::parse("name"), Some(SortField::Name)));
         assert!(matches!(
-            SortField::from_str("created"),
+            SortField::parse("created"),
             Some(SortField::Created)
         ));
         assert!(matches!(
-            SortField::from_str("updated"),
+            SortField::parse("updated"),
             Some(SortField::Updated)
         ));
-        assert!(SortField::from_str("invalid").is_none());
+        assert!(SortField::parse("invalid").is_none());
     }
 
     #[test]
     fn test_sort_order_from_str() {
-        assert!(matches!(SortOrder::from_str("asc"), Some(SortOrder::Asc)));
-        assert!(matches!(SortOrder::from_str("desc"), Some(SortOrder::Desc)));
-        assert!(SortOrder::from_str("invalid").is_none());
+        assert!(matches!(SortOrder::parse("asc"), Some(SortOrder::Asc)));
+        assert!(matches!(SortOrder::parse("desc"), Some(SortOrder::Desc)));
+        assert!(SortOrder::parse("invalid").is_none());
     }
 }
