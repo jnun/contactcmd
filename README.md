@@ -150,4 +150,4 @@ cargo run -- --help  # Run in development
 
 ## License
 
-MIT
+Private, for distribute by 5DayApp
