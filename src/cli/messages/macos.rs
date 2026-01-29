@@ -1,0 +1,1154 @@
+//! macOS Messages database integration.
+//!
+//! Reads the most recent iMessage for a given contact by querying
+//! ~/Library/Messages/chat.db
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags};
+use std::io::Write;
+use std::path::PathBuf;
+
+use crate::db::Database;
+use super::super::display::format_message_date;
+use super::super::ui::visible_lines;
+
+/// Represents a message from the Messages app
+#[derive(Debug, Clone)]
+pub struct LastMessage {
+    pub text: String,
+    pub date: DateTime<Local>,
+    pub is_from_me: bool,
+    pub handle: String,
+}
+
+/// Get the path to the Messages database
+fn messages_db_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    PathBuf::from(home).join("Library/Messages/chat.db")
+}
+
+/// Normalize a phone number to digits only, handling country code variations
+fn normalize_phone(phone: &str) -> String {
+    let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    // Handle US country code: if starts with 1 and is 11 digits, strip the 1
+    if digits.len() == 11 && digits.starts_with('1') {
+        digits[1..].to_string()
+    } else {
+        digits
+    }
+}
+
+/// Check if two phone numbers match (after normalization)
+fn phones_match(phone1: &str, phone2: &str) -> bool {
+    let n1 = normalize_phone(phone1);
+    let n2 = normalize_phone(phone2);
+
+    if n1.is_empty() || n2.is_empty() {
+        return false;
+    }
+
+    // Direct match
+    if n1 == n2 {
+        return true;
+    }
+
+    // Handle case where one has country code and other doesn't
+    // e.g., "15551234567" should match "5551234567"
+    if n1.len() > n2.len() {
+        n1.ends_with(&n2)
+    } else {
+        n2.ends_with(&n1)
+    }
+}
+
+/// Convert Apple's CoreData timestamp (nanoseconds since 2001-01-01) to DateTime
+fn apple_timestamp_to_datetime(timestamp: i64) -> DateTime<Local> {
+    // Apple uses nanoseconds since 2001-01-01 00:00:00 UTC
+    // Unix epoch is 1970-01-01, so we need to add the difference
+    const APPLE_EPOCH_OFFSET: i64 = 978307200; // seconds from 1970 to 2001
+
+    // Timestamps after ~2017 are in nanoseconds, before that in seconds
+    // We detect this by checking if the value is unreasonably large for seconds
+    let seconds = if timestamp > 1_000_000_000_000_000 {
+        // Nanoseconds - convert to seconds
+        (timestamp / 1_000_000_000) + APPLE_EPOCH_OFFSET
+    } else if timestamp > 1_000_000_000_000 {
+        // Microseconds - some older formats
+        (timestamp / 1_000_000) + APPLE_EPOCH_OFFSET
+    } else {
+        // Already seconds
+        timestamp + APPLE_EPOCH_OFFSET
+    };
+
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .map(|dt| dt.with_timezone(&Local))
+        .unwrap_or_else(|| Local::now())
+}
+
+/// Known NSClass names to filter out when extracting text from attributedBody blobs
+const NS_CLASS_NAMES: &[&str] = &[
+    "NSString", "NSDictionary", "NSNumber", "NSArray", "NSData",
+    "NSValue", "NSNull", "NSMutableString", "NSMutableDictionary",
+    "NSMutableArray", "NSMutableData", "NSAttributedString",
+    "NSMutableAttributedString", "NSParagraphStyle",
+    "NSMutableParagraphStyle", "NSFont", "NSColor",
+    "__NSCFString", "__NSCFDictionary", "__NSCFArray",
+    "__NSCFNumber", "__NSCFBoolean", "__NSCFData",
+    "NSUUID", "NSURL", "NSDate", "NSObject",
+    "NSShadow", "NSUnderlineStyle", "NSRange", "NSSet", "NSMutableSet",
+    "NSPresentationIntent", "NSPresentationIntentTableColumn",
+    "WNSValue", "WNSArray", "WNSString", "WNSDictionary",
+];
+
+/// Check if a string is an iMessage attachment reference (e.g. "at_0_9FBE0289-...")
+fn is_attachment_ref(s: &str) -> bool {
+    // Pattern: "at_" + digit(s) + "_" + UUID-like hex/dashes
+    if let Some(rest) = s.strip_prefix("at_") {
+        // Find the next underscore after the digits
+        if let Some(pos) = rest.find('_') {
+            let digits = &rest[..pos];
+            let after = &rest[pos + 1..];
+            return !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+                && !after.is_empty()
+                && after.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        }
+    }
+    false
+}
+
+/// Extract readable text from an attributedBody blob.
+///
+/// Modern iMessages store the message content in an NSArchiver blob rather than
+/// the `text` column. This function finds the longest printable ASCII/UTF-8
+/// segment in the blob, filtering out known Cocoa class names.
+pub fn extract_text_from_body(blob: &[u8]) -> Option<String> {
+    if blob.is_empty() {
+        return None;
+    }
+
+    // Find all runs of printable characters (including common Unicode)
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for &byte in blob {
+        // Accept printable ASCII range plus common extended chars
+        if byte >= 0x20 && byte < 0x7F {
+            current.push(byte as char);
+        } else {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    // Filter out known NS class names and very short segments
+    let filtered: Vec<&String> = segments.iter()
+        .filter(|s| s.len() >= 2)
+        .filter(|s| !NS_CLASS_NAMES.contains(&s.as_str()))
+        .filter(|s| {
+            // Filter out common binary artifact patterns
+            let trimmed = s.trim();
+            !trimmed.is_empty()
+                && !trimmed.chars().all(|c| matches!(c, '+' | '.' | '#' | '@' | '\'' | '(' | ')' | '*' | ',' | ';' | ':'))
+                && !trimmed.starts_with("streamtyped")
+                && !trimmed.starts_with("NSKeyedArchiver")
+                && !trimmed.starts_with("$class")
+                && !trimmed.starts_with("NS.keys")
+                && !trimmed.starts_with("NS.objects")
+                && !trimmed.starts_with("NS.string")
+                && !trimmed.starts_with("NS.bytes")
+                && !trimmed.starts_with("NS.time")
+                && !trimmed.starts_with("NS.base")
+                && !trimmed.starts_with("NS.length")
+                && !trimmed.starts_with("NS.special")
+                && !trimmed.starts_with("$classname")
+                && !trimmed.starts_with("$classes")
+                && !trimmed.starts_with("$null")
+                && !trimmed.starts_with("NSStoreModelVersionHashes")
+                && !is_attachment_ref(trimmed)
+                // Also filter strings containing binary plist markers anywhere
+                && !trimmed.contains("$version")
+                && !trimmed.contains("$archiver")
+                && !trimmed.contains("$objects")
+                && !trimmed.contains("$top")
+                && !trimmed.contains("$class")
+                && !trimmed.contains("NSValue")
+                && !trimmed.contains("NSString")
+                && !trimmed.contains("NSNumber")
+                && !trimmed.contains("NSArray")
+                && !trimmed.contains("NSDictionary")
+                && !trimmed.contains("NSData")
+                && !trimmed.contains("__kIM")
+                && !trimmed.contains("__kCF")
+                && !trimmed.contains("__NS")
+                && !trimmed.starts_with("__k")
+                && !trimmed.starts_with("_NS")
+                && !trimmed.starts_with("WNS")
+                && !trimmed.contains("NSObject")
+                && !trimmed.contains("AttributeName")
+                && !trimmed.contains("PartAttribute")
+        })
+        .collect();
+
+    // Filter out binary plist text, then return the longest remaining segment
+    filtered.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !is_binary_plist_text(s))
+        .max_by_key(|s| s.len())
+}
+
+/// Open the Messages database, returning None if unavailable
+fn open_messages_db() -> Result<Option<Connection>> {
+    let db_path = messages_db_path();
+
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("permission") || err_str.contains("unable to open") {
+                return Ok(None);
+            }
+            Err(e).context("Failed to open Messages database")
+        }
+    }
+}
+
+/// Check if text looks like binary plist/NSKeyedArchiver data stored as string
+fn is_binary_plist_text(text: &str) -> bool {
+    // NSKeyedArchiver format markers
+    if text.contains("$archiver") || text.contains("$version") || text.contains("$objects") {
+        return true;
+    }
+    // Binary plist signature
+    if text.starts_with("bplist") {
+        return true;
+    }
+    // iMessage internal attribute markers
+    if text.contains("__kIM") || text.contains("__kCF") || text.contains("__NS") {
+        return true;
+    }
+    // WNS (wrapped NS) class markers
+    if text.contains("WNSValue") || text.contains("WNSArray") || text.contains("WNSString") {
+        return true;
+    }
+    // High ratio of non-printable characters suggests binary data
+    let non_printable = text.chars().filter(|c| !c.is_ascii_graphic() && !c.is_whitespace()).count();
+    let total = text.len();
+    if total > 10 && non_printable > total / 4 {
+        return true;
+    }
+    false
+}
+
+/// Extract text from a message row, trying `text` column first, then `attributedBody`
+fn extract_message_text(text: Option<String>, attributed_body: Option<Vec<u8>>) -> Option<String> {
+    // Prefer the text column if it has readable content
+    if let Some(ref t) = text {
+        if !t.is_empty() && !is_binary_plist_text(t) {
+            return Some(t.clone());
+        }
+    }
+
+    // Fall back to extracting from attributedBody blob
+    if let Some(ref blob) = attributed_body {
+        return extract_text_from_body(blob);
+    }
+
+    None
+}
+
+/// Query the Messages database for the most recent message matching any of the given phone numbers
+pub fn get_last_message_for_phones(phones: &[String]) -> Result<Option<LastMessage>> {
+    get_last_message_for_handles(phones, &[])
+}
+
+/// Generate possible handle formats for a phone number
+fn phone_handle_patterns(phone: &str) -> Vec<String> {
+    let digits = normalize_phone(phone);
+    if digits.is_empty() {
+        return vec![];
+    }
+
+    // Generate common formats: with/without +1 prefix
+    let mut patterns = vec![
+        digits.clone(),
+        format!("+1{}", digits),
+        format!("+{}", digits),
+    ];
+
+    // If it's 10 digits, also try with 1 prefix (no +)
+    if digits.len() == 10 {
+        patterns.push(format!("1{}", digits));
+    }
+
+    patterns
+}
+
+/// Query the Messages database for the most recent message matching phones OR emails
+pub fn get_last_message_for_handles(phones: &[String], emails: &[String]) -> Result<Option<LastMessage>> {
+    if phones.is_empty() && emails.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = match open_messages_db()? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    // Build targeted handle patterns
+    let mut handle_patterns: Vec<String> = Vec::new();
+    for phone in phones {
+        handle_patterns.extend(phone_handle_patterns(phone));
+    }
+    for email in emails {
+        handle_patterns.push(email.to_lowercase());
+    }
+
+    if handle_patterns.is_empty() {
+        return Ok(None);
+    }
+
+    // Query handles matching our specific patterns
+    let placeholders: Vec<String> = handle_patterns.iter().map(|_| "LOWER(id) = LOWER(?)".to_string()).collect();
+    let handle_query = format!(
+        "SELECT ROWID FROM handle WHERE {}",
+        placeholders.join(" OR ")
+    );
+
+    let mut handle_stmt = match conn.prepare(&handle_query) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(None);
+            }
+            return Err(e).context("Failed to query handles");
+        }
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = handle_patterns
+        .iter()
+        .map(|p| p as &dyn rusqlite::ToSql)
+        .collect();
+
+    let handle_rows = handle_stmt.query_map(param_refs.as_slice(), |row| {
+        row.get::<_, i64>(0)
+    })?;
+
+    let matching_rowids: Vec<i64> = handle_rows.filter_map(|r| r.ok()).collect();
+
+    if matching_rowids.is_empty() {
+        return Ok(None);
+    }
+
+    // Query the most recent message for matching handles
+    let msg_placeholders: Vec<String> = matching_rowids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        r#"SELECT m.text, m.attributedBody, m.date, m.is_from_me, h.id
+           FROM message m
+           INNER JOIN handle h ON m.handle_id = h.ROWID
+           WHERE m.handle_id IN ({})
+           ORDER BY m.date DESC
+           LIMIT 10"#,
+        msg_placeholders.join(", ")
+    );
+
+    let mut stmt = match conn.prepare(&query) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(e).context("Failed to prepare message query");
+        }
+    };
+
+    let rowid_refs: Vec<&dyn rusqlite::ToSql> = matching_rowids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let rows = stmt.query_map(rowid_refs.as_slice(), |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i32>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    for row_result in rows {
+        let (text, attributed_body, date, is_from_me, handle) = match row_result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if let Some(msg_text) = extract_message_text(text, attributed_body) {
+            return Ok(Some(LastMessage {
+                text: msg_text,
+                date: apple_timestamp_to_datetime(date),
+                is_from_me: is_from_me != 0,
+                handle,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Query the Messages database for multiple recent messages matching any of the given phone numbers
+pub fn get_messages_for_phones(phones: &[String], limit: u32) -> Result<Vec<LastMessage>> {
+    get_messages_for_handles(phones, &[], limit)
+}
+
+/// Query the Messages database for messages matching phone numbers OR email addresses
+pub fn get_messages_for_handles(phones: &[String], emails: &[String], limit: u32) -> Result<Vec<LastMessage>> {
+    if phones.is_empty() && emails.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let conn = match open_messages_db()? {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+
+    // Build targeted handle patterns for this contact only
+    let mut handle_patterns: Vec<String> = Vec::new();
+    for phone in phones {
+        handle_patterns.extend(phone_handle_patterns(phone));
+    }
+    for email in emails {
+        handle_patterns.push(email.to_lowercase());
+    }
+
+    if handle_patterns.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Query handles matching our specific patterns
+    let placeholders: Vec<String> = handle_patterns.iter().map(|_| "LOWER(id) = LOWER(?)".to_string()).collect();
+    let handle_query = format!(
+        "SELECT ROWID FROM handle WHERE {}",
+        placeholders.join(" OR ")
+    );
+
+    let mut handle_stmt = match conn.prepare(&handle_query) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(vec![]);
+            }
+            return Err(e).context("Failed to query handles");
+        }
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = handle_patterns
+        .iter()
+        .map(|p| p as &dyn rusqlite::ToSql)
+        .collect();
+
+    let handle_rows = handle_stmt.query_map(param_refs.as_slice(), |row| {
+        row.get::<_, i64>(0)
+    })?;
+
+    let matching_rowids: Vec<i64> = handle_rows.filter_map(|r| r.ok()).collect();
+
+    if matching_rowids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Query messages for matching handles only
+    let msg_placeholders: Vec<String> = matching_rowids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        r#"SELECT m.text, m.attributedBody, m.date, m.is_from_me, h.id
+           FROM message m
+           INNER JOIN handle h ON m.handle_id = h.ROWID
+           WHERE m.handle_id IN ({})
+           ORDER BY m.date DESC
+           LIMIT ?"#,
+        msg_placeholders.join(", ")
+    );
+
+    let mut stmt = match conn.prepare(&query) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(e).context("Failed to prepare message query");
+        }
+    };
+
+    // Build params: handle ROWIDs + limit
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = matching_rowids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    params.push(Box::new(limit));
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i32>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut messages = Vec::new();
+    for row_result in rows {
+        let (text, attributed_body, date, is_from_me, handle) = match row_result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if let Some(msg_text) = extract_message_text(text, attributed_body) {
+            messages.push(LastMessage {
+                text: msg_text,
+                date: apple_timestamp_to_datetime(date),
+                is_from_me: is_from_me != 0,
+                handle,
+            });
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Search recent messages for terms (case-insensitive AND match on all terms)
+pub fn search_messages(terms: &[&str], limit: u32) -> Result<Vec<LastMessage>> {
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let conn = match open_messages_db()? {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+
+    let query = r#"
+        SELECT m.text, m.attributedBody, m.date, m.is_from_me, h.id
+        FROM message m
+        INNER JOIN handle h ON m.handle_id = h.ROWID
+        ORDER BY m.date DESC
+        LIMIT 5000
+    "#;
+
+    let mut stmt = match conn.prepare(query) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(vec![]);
+            }
+            return Err(e).context("Failed to query Messages database");
+        }
+    };
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i32>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    let mut results = Vec::new();
+
+    for row_result in rows {
+        if results.len() >= limit as usize {
+            break;
+        }
+
+        let (text, attributed_body, date, is_from_me, handle) = match row_result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let msg_text = match extract_message_text(text, attributed_body) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let text_lower = msg_text.to_lowercase();
+        let all_match = lower_terms.iter().all(|term| text_lower.contains(term.as_str()));
+
+        if all_match {
+            results.push(LastMessage {
+                text: msg_text,
+                date: apple_timestamp_to_datetime(date),
+                is_from_me: is_from_me != 0,
+                handle,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// A group of messages from a single handle, with resolved contact info
+struct MessageGroup {
+    handle: String,
+    contact_name: String,
+    location: Option<String>,
+    messages: Vec<LastMessage>,
+}
+
+/// Extract a snippet of text centered around the first occurrence of a search term
+fn snippet_around_match(text: &str, search_terms: &[String], max_len: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+    let char_count = trimmed.chars().count();
+
+    // If text fits, return as-is
+    if char_count <= max_len {
+        return trimmed.to_string();
+    }
+
+    let text_lower = trimmed.to_lowercase();
+
+    // Find the first matching term and its position
+    let mut best_pos: Option<usize> = None;
+    for term in search_terms {
+        if let Some(byte_pos) = text_lower.find(term.as_str()) {
+            // Convert byte position to character position
+            let char_pos = text_lower[..byte_pos].chars().count();
+            if best_pos.is_none() || char_pos < best_pos.unwrap() {
+                best_pos = Some(char_pos);
+            }
+        }
+    }
+
+    let match_pos = match best_pos {
+        Some(pos) => pos,
+        None => return truncate_to_width(text, max_len), // Fallback to start
+    };
+
+    // Calculate window around match (leave room for ellipsis on both sides)
+    let content_len = max_len - 6; // "..." on each side
+    let half_window = content_len / 2;
+
+    let (start, end, prefix, suffix) = if match_pos <= half_window {
+        // Match is near the start - show from beginning
+        let end = std::cmp::min(max_len - 3, char_count);
+        (0, end, "", "...")
+    } else if match_pos + half_window >= char_count {
+        // Match is near the end - show the end
+        let start = char_count.saturating_sub(max_len - 3);
+        (start, char_count, "...", "")
+    } else {
+        // Match is in the middle - center around it
+        let start = match_pos.saturating_sub(half_window);
+        let end = std::cmp::min(start + content_len, char_count);
+        (start, end, "...", "...")
+    };
+
+    let snippet: String = trimmed.chars().skip(start).take(end - start).collect();
+    format!("{}{}{}", prefix, snippet.trim(), suffix)
+}
+
+/// RAII guard that ensures raw mode is disabled on drop
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Run the messages search command with interactive review-style navigation
+pub fn run_messages(db: &Database, query: &str) -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent};
+    use crate::cli::ui::clear_screen;
+
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        println!("Usage: contactcmd messages \"search terms\"");
+        return Ok(());
+    }
+
+    // Keep lowercase search terms for snippet centering
+    let search_terms: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+
+    let results = search_messages(&words, 200)?;
+
+    if results.is_empty() {
+        println!("No messages.");
+        return Ok(());
+    }
+
+    // Group results by handle, preserving insertion order
+    let mut handle_order: Vec<String> = Vec::new();
+    let mut by_handle: std::collections::HashMap<String, Vec<LastMessage>> =
+        std::collections::HashMap::new();
+    for msg in results {
+        if !by_handle.contains_key(&msg.handle) {
+            handle_order.push(msg.handle.clone());
+        }
+        by_handle.entry(msg.handle.clone()).or_default().push(msg);
+    }
+
+    // Resolve each handle to contact name + location
+    let all_persons = db.list_persons(u32::MAX, 0)?;
+    let mut groups: Vec<MessageGroup> = Vec::new();
+
+    for handle in handle_order {
+        let messages = by_handle.remove(&handle).unwrap_or_default();
+        let (contact_name, location) = resolve_handle_info(db, &handle, &all_persons);
+        groups.push(MessageGroup {
+            handle,
+            contact_name,
+            location,
+            messages,
+        });
+    }
+
+    // Interactive review loop
+    let mut index: usize = 0;
+    let mut scroll: usize = 0;
+    let mut selected: usize = 0; // Selected message within the visible window
+
+    loop {
+        let num_visible = visible_lines(); // Recalculate for resize support
+        let group = &groups[index];
+        let total_msgs = group.messages.len();
+
+        // Ensure selected stays within bounds
+        let max_selected = std::cmp::min(num_visible, total_msgs.saturating_sub(scroll));
+        if selected >= max_selected && max_selected > 0 {
+            selected = max_selected - 1;
+        }
+
+        clear_screen()?;
+
+        // Header
+        println!("Messages: {}\n", group.contact_name);
+
+        // Subheader: location and handle
+        let loc = group.location.as_deref().unwrap_or("");
+        if !loc.is_empty() {
+            println!("  {}", loc);
+        }
+        println!("  {}\n", group.handle);
+
+        // Messages with scroll offset
+        let end = std::cmp::min(scroll + num_visible, total_msgs);
+        for (i, msg) in group.messages[scroll..end].iter().enumerate() {
+            let direction = if msg.is_from_me { ">" } else { "<" };
+            let date_str = format_message_date(&msg.date);
+            let text = snippet_around_match(&msg.text, &search_terms, 50);
+
+            // Mark selected message with indicator
+            let marker = if i == selected { ">" } else { " " };
+            println!("{} {} {} \"{}\"", marker, direction, date_str, text);
+        }
+
+        // Pad to keep footer in a stable position
+        let displayed = end - scroll;
+        for _ in displayed..num_visible {
+            println!();
+        }
+
+        // Footer
+        println!();
+        let range_str = if total_msgs > num_visible {
+            format!("  {}-{} of {}", scroll + 1, end, total_msgs)
+        } else {
+            String::new()
+        };
+        println!(
+            "{} of {}  {} message(s){}",
+            index + 1,
+            groups.len(),
+            total_msgs,
+            range_str
+        );
+        print!("[←/→] contact [↑/↓] select [enter] expand [q]uit: ");
+        std::io::stdout().flush()?;
+
+        // Read single key with RAII guard for raw mode
+        let action = {
+            let _guard = RawModeGuard::new()?;
+            match event::read()? {
+                Event::Key(KeyEvent { code, .. }) => code,
+                _ => continue,
+            }
+        };
+
+        match action {
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                if index + 1 < groups.len() {
+                    index += 1;
+                    scroll = 0;
+                    selected = 0;
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if index > 0 {
+                    index -= 1;
+                    scroll = 0;
+                    selected = 0;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max_idx = std::cmp::min(num_visible, total_msgs.saturating_sub(scroll));
+                if selected + 1 < max_idx {
+                    // Move selection down within visible window
+                    selected += 1;
+                } else if scroll + num_visible < total_msgs {
+                    // Scroll down and keep selection at bottom
+                    scroll += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if selected > 0 {
+                    // Move selection up within visible window
+                    selected -= 1;
+                } else if scroll > 0 {
+                    // Scroll up and keep selection at top
+                    scroll -= 1;
+                }
+            }
+            KeyCode::Enter => {
+                // Show expanded message
+                let msg_index = scroll + selected;
+                if msg_index < total_msgs {
+                    show_expanded_message(
+                        &group.messages[msg_index],
+                        &group.contact_name,
+                    )?;
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    clear_screen()?;
+    Ok(())
+}
+
+/// Display the full message content in an expanded view
+fn show_expanded_message(
+    msg: &LastMessage,
+    contact_name: &str,
+) -> Result<()> {
+    use crossterm::event;
+    use crate::cli::ui::clear_screen;
+
+    clear_screen()?;
+
+    // Header
+    let direction = if msg.is_from_me { ">" } else { "<" };
+    println!("{} {}\n", direction, contact_name);
+
+    // Metadata
+    let date_str = format_message_date(&msg.date);
+    println!("  {}", date_str);
+    println!("  {}\n", msg.handle);
+
+    // Full message text with word wrapping
+    let wrapped = wrap_text(&msg.text, 76);
+    for line in &wrapped {
+        println!("  {}", line);
+    }
+
+    println!();
+    print!("[enter] or [q]uit: ");
+    std::io::stdout().flush()?;
+
+    // Wait for key with RAII guard
+    let _guard = RawModeGuard::new()?;
+    let _ = event::read();
+
+    Ok(())
+}
+
+/// Wrap text to specified width (character-aware for Unicode safety)
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for paragraph in text.lines() {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut current_line = String::new();
+        let mut current_width = 0usize;
+
+        for word in paragraph.split_whitespace() {
+            let word_width = word.chars().count();
+
+            if current_line.is_empty() {
+                // Word longer than width - take it anyway (antifragile: don't lose data)
+                current_line = word.to_string();
+                current_width = word_width;
+            } else if current_width + 1 + word_width <= width {
+                current_line.push(' ');
+                current_line.push_str(word);
+                current_width += 1 + word_width;
+            } else {
+                lines.push(current_line);
+                current_line = word.to_string();
+                current_width = word_width;
+            }
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+    }
+
+    lines
+}
+
+/// Resolve a Messages handle to contact name + location (city, state)
+fn resolve_handle_info(
+    db: &Database,
+    handle: &str,
+    all_persons: &[crate::models::Person],
+) -> (String, Option<String>) {
+    for person in all_persons {
+        let phones = match db.get_phones_for_person(person.id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for phone in &phones {
+            if phones_match(handle, &phone.phone_number) {
+                let name = person
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| handle.to_string());
+                let location = person_location(db, person.id);
+                return (name, location);
+            }
+        }
+
+        let emails = match db.get_emails_for_person(person.id) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for email in &emails {
+            if email.email_address.eq_ignore_ascii_case(handle) {
+                let name = person
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| handle.to_string());
+                let location = person_location(db, person.id);
+                return (name, location);
+            }
+        }
+    }
+
+    (handle.to_string(), None)
+}
+
+/// Get city/state for a person
+fn person_location(db: &Database, person_id: uuid::Uuid) -> Option<String> {
+    let detail = db.get_contact_detail(person_id).ok()??;
+    let addr = detail.addresses.first()?;
+    match (&addr.city, &addr.state) {
+        (Some(c), Some(s)) => Some(format!("{}, {}", c, s)),
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(s)) => Some(s.clone()),
+        (None, None) => None,
+    }
+}
+
+/// Truncate text to terminal width
+fn truncate_to_width(text: &str, max_len: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+    if trimmed.chars().count() <= max_len {
+        trimmed.to_string()
+    } else {
+        let truncated: String = trimmed.chars().take(max_len - 3).collect();
+        format!("{}...", truncated.trim_end())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+
+    #[test]
+    fn test_normalize_phone() {
+        assert_eq!(normalize_phone("+1 (555) 123-4567"), "5551234567");
+        assert_eq!(normalize_phone("555-123-4567"), "5551234567");
+        assert_eq!(normalize_phone("15551234567"), "5551234567");
+        assert_eq!(normalize_phone("5551234567"), "5551234567");
+    }
+
+    #[test]
+    fn test_phones_match() {
+        assert!(phones_match("+1 (555) 123-4567", "5551234567"));
+        assert!(phones_match("15551234567", "555-123-4567"));
+        assert!(phones_match("5551234567", "5551234567"));
+        assert!(!phones_match("5551234567", "5551234568"));
+        assert!(!phones_match("", "5551234567"));
+    }
+
+    #[test]
+    fn test_apple_timestamp_conversion() {
+        // Test a known timestamp (roughly 2024)
+        let ts = 727_000_000_000_000_000i64; // nanoseconds
+        let dt = apple_timestamp_to_datetime(ts);
+        // Should be a reasonable date (after 2020)
+        assert!(dt.year() >= 2020);
+    }
+
+    #[test]
+    fn test_empty_phones() {
+        let result = get_last_message_for_phones(&[]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_text_from_body_with_message() {
+        // Simulate an NSKeyedArchiver blob with message text embedded
+        let mut blob: Vec<u8> = Vec::new();
+        // Binary preamble
+        blob.extend_from_slice(b"\x04\x0b\x01\x00");
+        blob.extend_from_slice(b"streamtyped");
+        blob.extend_from_slice(&[0x00, 0x01, 0x02]);
+        blob.extend_from_slice(b"NSMutableAttributedString");
+        blob.extend_from_slice(&[0x00, 0x03, 0x04]);
+        blob.extend_from_slice(b"NSAttributedString");
+        blob.extend_from_slice(&[0x00, 0x05, 0x06]);
+        // The actual message text
+        blob.extend_from_slice(b"Hey Jason. Are you able to push to 10?");
+        blob.extend_from_slice(&[0x00, 0x07, 0x08]);
+        blob.extend_from_slice(b"NSDictionary");
+        blob.extend_from_slice(&[0x00, 0x09, 0x0A]);
+
+        let result = extract_text_from_body(&blob);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "Hey Jason. Are you able to push to 10?");
+    }
+
+    #[test]
+    fn test_extract_text_from_body_empty() {
+        assert!(extract_text_from_body(&[]).is_none());
+    }
+
+    #[test]
+    fn test_extract_text_from_body_no_printable() {
+        let blob = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(extract_text_from_body(&blob).is_none());
+    }
+
+    #[test]
+    fn test_is_binary_plist_text_with_archiver_markers() {
+        // NSKeyedArchiver format with $archiver marker
+        assert!(is_binary_plist_text("X$versionY$archiverT$topX$objects"));
+        assert!(is_binary_plist_text("something$versionother"));
+        assert!(is_binary_plist_text("data$objectsmore"));
+    }
+
+    #[test]
+    fn test_is_binary_plist_text_with_bplist() {
+        assert!(is_binary_plist_text("bplist00\x00\x01\x02"));
+    }
+
+    #[test]
+    fn test_is_binary_plist_text_normal_text() {
+        assert!(!is_binary_plist_text("Hello, how are you?"));
+        assert!(!is_binary_plist_text("Meeting at 3pm tomorrow"));
+        assert!(!is_binary_plist_text(""));
+    }
+
+    #[test]
+    fn test_snippet_around_match_short_text() {
+        // Text fits within max_len, return as-is
+        let terms = vec!["hello".to_string()];
+        let result = snippet_around_match("Hello world", &terms, 52);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn test_snippet_around_match_term_at_start() {
+        // Search term near start - should show from beginning with ellipsis at end
+        let terms = vec!["hello".to_string()];
+        let text = "Hello world, this is a very long message that exceeds the maximum length allowed";
+        let result = snippet_around_match(text, &terms, 40);
+        assert!(result.starts_with("Hello"));
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 40);
+    }
+
+    #[test]
+    fn test_snippet_around_match_term_in_middle() {
+        // Search term in middle - should show snippet centered around match
+        let terms = vec!["sexy".to_string()];
+        let text = "I'm 28 years old and just graduated from university and I think this is super sexy and I killed it with my presentation today";
+        let result = snippet_around_match(text, &terms, 52);
+        // Should contain the search term
+        assert!(result.to_lowercase().contains("sexy"));
+        // Should have ellipsis on both ends since match is in middle
+        assert!(result.starts_with("...") || result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_snippet_around_match_term_at_end() {
+        // Search term near end - should show end with ellipsis at start
+        let terms = vec!["done".to_string()];
+        let text = "This is a very long message that keeps going and going until finally we are done";
+        let result = snippet_around_match(text, &terms, 40);
+        assert!(result.to_lowercase().contains("done"));
+        assert!(result.starts_with("..."));
+    }
+
+    #[test]
+    fn test_snippet_around_match_no_match_fallback() {
+        // No match found - should fall back to truncate_to_width behavior
+        let terms = vec!["xyz".to_string()];
+        let text = "This is a message that doesn't contain the search term at all";
+        let result = snippet_around_match(text, &terms, 30);
+        // Should truncate from start
+        assert!(result.starts_with("This"));
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_wrap_text_unicode_width() {
+        // Japanese characters - each counts as 1 char for our purposes
+        let text = "これは日本語のテストです";
+        let wrapped = wrap_text(text, 5);
+        // Should not panic, should produce some output
+        assert!(!wrapped.is_empty());
+    }
+
+    #[test]
+    fn test_wrap_text_long_word() {
+        // Antifragile: very long word shouldn't cause issues
+        let text = "pneumonoultramicroscopicsilicovolcanoconiosis is a word";
+        let wrapped = wrap_text(text, 10);
+        // Long word should be kept intact (don't lose data)
+        assert!(wrapped.iter().any(|line| line.contains("pneumono")));
+    }
+}

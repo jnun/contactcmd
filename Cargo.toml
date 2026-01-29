@@ -1,0 +1,30 @@
+[package]
+name = "contactcmd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Personal CRM for the command line"
+license = "MIT"
+repository = "https://github.com/jnun/contactcmd"
+authors = ["jnun"]
+keywords = ["cli", "contacts", "crm", "macos"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+crossterm = "0.29"
+inquire = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-contacts = { version = "0.3", features = ["block2", "CNContact", "CNContactStore", "CNContactFetchRequest", "CNLabeledValue", "CNPhoneNumber", "CNPostalAddress"] }
+objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSArray", "NSError", "NSCalendar", "NSPredicate", "NSObjCRuntime", "NSKeyValueCoding"] }
+block2 = "0.6"

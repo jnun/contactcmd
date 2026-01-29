@@ -1,0 +1,127 @@
+# Rust/Cargo
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Debug symbols and profiling
+*.dSYM/
+*.profdata
+*.profraw
+core
+
+# Test coverage
+coverage/
+*.lcov
+*.gcov
+*.gcda
+*.gcno
+tarpaulin-report.html
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk
+
+# Editor Files
+.vscode/
+.idea/
+*.sublime-*
+.nova/
+*.swp
+*.swo
+*~
+\#*#
+.#*
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.log
+.~lock.*
+
+# Shell/Script artifacts
+*.pid
+*.seed
+*.pid.lock
+nohup.out
+
+# Archive Files (if users zip up old work)
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+.secrets
+*.secret
+credentials
+credentials.*
+.netrc
+*.keystore
+*.token
+token.txt
+auth.json
+
+# SSH keys (if copied into project)
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+
+# Database files (application data)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Cloud provider credentials
+.aws/
+.azure/
+.gcloud/
+service-account*.json
+
+# Local data (expand as needed)
+docs/data/*.csv
+docs/data/*.json
+docs/data/*.xml
+docs/data/*.sql
+
+# Design files (binary/large files)
+docs/designs/*.psd
+docs/designs/*.ai
+docs/designs/*.sketch
+docs/designs/*.fig
+docs/designs/*.xd
+
+# Documentation builds (if using doc generators)
+docs/_build/
+docs/.doctrees/
+site/
+
+# macOS Finder
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDouble
+.LSOverride
+Icon?
+._*

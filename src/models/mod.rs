@@ -1,0 +1,21 @@
+mod address;
+mod contact_detail;
+mod email;
+mod interaction;
+mod note;
+mod organization;
+mod person;
+mod phone;
+mod special_date;
+mod tag;
+
+pub use address::*;
+pub use contact_detail::*;
+pub use email::*;
+pub use interaction::*;
+pub use note::*;
+pub use organization::*;
+pub use person::*;
+pub use phone::*;
+pub use special_date::*;
+pub use tag::*;
