@@ -2,19 +2,32 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     style::{Attribute, SetAttribute},
-    terminal::{disable_raw_mode, enable_raw_mode},
     ExecutableCommand,
 };
+use rfd::FileDialog;
 use std::io::{self, IsTerminal, Write};
 
-use crate::cli::display::print_full_contact;
-use crate::cli::show::{run_show, show_messages_screen};
-use crate::cli::ui::{clear_screen, is_valid_email, prompt_field, visible_lines, FormResult};
+use crate::cli::display::print_full_contact_with_tasks;
+use crate::cli::photo_utils;
+use crate::cli::show::show_messages_screen;
+use crate::cli::task::run_tasks_for_contact;
+use crate::cli::ui::{
+    clear_screen, confirm, is_valid_email, prompt_field, prompt_undo, select, show_help,
+    task_action_label, visible_lines, FormResult, RawModeGuard, StatusBar, truncate,
+};
+use crate::models::{NameOrder, PersonType};
 #[cfg(target_os = "macos")]
 use crate::cli::sync::{delete_from_macos_contacts, get_apple_id};
 use crate::db::Database;
-use crate::models::{Email, PersonOrganization, Phone};
+use crate::models::PersonOrganization;
 
+/// View mode for unified browse function
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum ViewMode {
+    #[default]
+    Card,
+    Table,
+}
 
 /// Contact data prepared for list display
 pub struct ContactListRow {
@@ -77,27 +90,12 @@ impl SortOrder {
     }
 }
 
-/// RAII guard that ensures raw mode is disabled on drop
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
-}
 
 /// Execute the list command
 pub fn run_list(
     db: &Database,
-    page: u32,
-    limit: u32,
+    _page: u32,
+    _limit: u32,
     sort: Option<String>,
     order: String,
     all: bool,
@@ -117,7 +115,7 @@ pub fn run_list(
         return Ok(());
     }
 
-    // Review mode - interactive one-by-one review
+    // Review mode - interactive browse
     if review {
         let persons = db.list_persons_sorted(
             total,
@@ -125,7 +123,7 @@ pub fn run_list(
             sort_field.to_sql_column(),
             sort_order.to_sql(),
         )?;
-        return run_browse_mode(db, persons);
+        return run_browse(db, persons, ViewMode::Card);
     }
 
     // Use non-interactive mode if --all flag or not a TTY
@@ -140,119 +138,14 @@ pub fn run_list(
         return Ok(());
     }
 
-    // Calculate dynamic limit based on terminal height (if limit is 0)
-    let effective_limit = if limit == 0 {
-        visible_lines() as u32
-    } else {
-        limit
-    };
-
-    // Interactive paginated mode (only when stdout is a TTY)
-    let total_pages = total.div_ceil(effective_limit);
-    let mut current_page = page.min(total_pages).max(1);
-
-    run_interactive_list(
-        db,
-        &mut current_page,
+    // Interactive table mode
+    let persons = db.list_persons_sorted(
         total,
-        sort_field,
-        sort_order,
-    )
-}
-
-fn run_interactive_list(
-    db: &Database,
-    _current_page: &mut u32,
-    total: u32,
-    sort_field: SortField,
-    sort_order: SortOrder,
-) -> Result<()> {
-    let mut cursor: usize = 0;  // Absolute index in full list
-    let mut scroll: usize = 0;  // First visible row
-
-    loop {
-        clear_screen()?;
-
-        // Recalculate visible lines on each iteration (handles terminal resize)
-        let visible = visible_lines();
-
-        // Adjust scroll to keep cursor visible
-        if cursor < scroll {
-            scroll = cursor;
-        } else if cursor >= scroll + visible {
-            scroll = cursor - visible + 1;
-        }
-
-        // Fetch only visible rows
-        let rows = db.list_contact_rows(
-            visible as u32,
-            scroll as u32,
-            sort_field.to_sql_column(),
-            sort_order.to_sql(),
-        )?;
-
-        print_table_header();
-
-        for (i, row) in rows.iter().enumerate() {
-            let absolute_idx = scroll + i;
-            print_contact_row(row, absolute_idx == cursor);
-        }
-
-        // Status bar
-        println!("\n{}/{}  [↑↓] move [←→] page [enter] view [esc] back", cursor + 1, total);
-
-        // Read key
-        let code = {
-            let _guard = RawModeGuard::new()?;
-            match event::read()? {
-                Event::Key(KeyEvent { code, .. }) => code,
-                _ => continue,
-            }
-        };
-
-        match code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if cursor + 1 < total as usize {
-                    cursor += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                cursor = cursor.saturating_sub(1);
-            }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
-                cursor = (cursor + visible).min(total as usize - 1);
-            }
-            KeyCode::PageUp | KeyCode::Left => {
-                cursor = cursor.saturating_sub(visible);
-            }
-            KeyCode::Right => {
-                cursor = (cursor + visible).min(total as usize - 1);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                cursor = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                cursor = total as usize - 1;
-            }
-            KeyCode::Enter => {
-                if !rows.is_empty() {
-                    let row_idx = cursor - scroll;
-                    if row_idx < rows.len() {
-                        let contact_id = rows[row_idx].id;
-                        if run_show(db, &contact_id.to_string())? {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
+        0,
+        sort_field.to_sql_column(),
+        sort_order.to_sql(),
+    )?;
+    run_browse(db, persons, ViewMode::Table)
 }
 
 /// Get terminal width, defaulting to 80 if unavailable
@@ -352,248 +245,257 @@ fn print_contact_row(row: &ContactListRow, selected: bool) {
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len - 3).collect();
-        format!("{}...", truncated)
-    }
-}
-
 // ============================================================================
-// Review/Browse Mode Implementation
+// Unified Browse Mode
 // ============================================================================
 
-/// Run the interactive browse/review mode with a pre-fetched list of persons
-pub fn run_browse_mode(db: &Database, persons: Vec<crate::models::Person>) -> Result<()> {
+/// Unified browse mode with card/table view toggle
+pub fn run_browse(db: &Database, persons: Vec<crate::models::Person>, initial_mode: ViewMode) -> Result<()> {
     if persons.is_empty() {
         println!("No contacts to browse.");
         return Ok(());
     }
 
-    let mut index = 0;
+    let mut index: usize = 0;
+    let mut scroll: usize = 0;
+    let mut view_mode = initial_mode;
+    let total = persons.len();
 
-    while index < persons.len() {
-        let person = &persons[index];
-
-        // Get full contact detail for display
-        let detail = match db.get_contact_detail(person.id)? {
-            Some(d) => d,
-            None => {
-                index += 1;
-                continue;
-            }
-        };
-
+    loop {
         clear_screen()?;
-        print_full_contact(&detail, None);
 
-        print!("\n{}/{}  [e]dit [m]essages [d]elete [←/→] [q]uit: ", index + 1, persons.len());
-        io::stdout().flush()?;
-
-        // Use raw mode for immediate single-key response
-        let action = {
-            let _guard = RawModeGuard::new()?;
-            match event::read()? {
-                Event::Key(KeyEvent { code, .. }) => code,
-                _ => continue,
-            }
-        };
-
-        match action {
-            KeyCode::Char('e') | KeyCode::Char('E') => {
-                println!();
-                if handle_edit(db, &detail)? {
-                    index += 1;
-                }
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                println!();
-                if handle_edit_all(db, &detail)? {
-                    index += 1;
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                println!();
-                handle_notes(db, &detail)?;
-                index += 1;
-            }
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                println!();
-                if show_messages_screen(db, &detail)? {
-                    break; // Quit requested from messages screen
-                }
-                // Continue showing same contact after returning from messages
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                // Delete immediately without confirmation
-                let display_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
-                println!();
-
-                // Delete from macOS Contacts if synced from there
-                #[cfg(target_os = "macos")]
-                if let Some(apple_id) = get_apple_id(&detail.person) {
-                    if let Err(e) = delete_from_macos_contacts(&apple_id) {
-                        eprintln!("Warning: Could not delete from macOS Contacts: {}", e);
-                    } else {
-                        println!("Deleted from macOS Contacts");
+        match view_mode {
+            ViewMode::Card => {
+                // Card view - show full contact detail
+                let person = &persons[index];
+                let detail = match db.get_contact_detail(person.id)? {
+                    Some(d) => d,
+                    None => {
+                        index = (index + 1).min(total - 1);
+                        continue;
                     }
+                };
+
+                let pending_tasks = db.get_pending_tasks_for_person(detail.person.id, 3)?;
+                print_full_contact_with_tasks(&detail, None, &pending_tasks);
+
+                let pending_count = pending_tasks.len() as u32;
+                let status = StatusBar::new()
+                    .counter(index + 1, total)
+                    .action("e", "dit")
+                    .action("m", "sg")
+                    .action("n", "ote")
+                    .action("t", &task_action_label(pending_count))
+                    .action("d", "el")
+                    .action("v", "iew")
+                    .separator()
+                    .action("?", "")
+                    .action("q", "")
+                    .action("Q", "uit")
+                    .render();
+                print!("\n{}: ", status);
+                io::stdout().flush()?;
+
+                let action = {
+                    let _guard = RawModeGuard::new()?;
+                    match event::read()? {
+                        Event::Key(KeyEvent { code, .. }) => code,
+                        _ => continue,
+                    }
+                };
+
+                match action {
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        println!();
+                        let detail = db.get_contact_detail(person.id)?.unwrap();
+                        handle_full_edit(db, &detail)?;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        println!();
+                        let detail = db.get_contact_detail(person.id)?.unwrap();
+                        handle_notes(db, &detail)?;
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        println!();
+                        let detail = db.get_contact_detail(person.id)?.unwrap();
+                        if show_messages_screen(db, &detail)? {
+                            break;
+                        }
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        println!();
+                        let person_name = person.display_name.as_deref().unwrap_or("(unnamed)");
+                        if run_tasks_for_contact(db, person.id, person_name)? {
+                            break;
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let display_name = person.display_name.as_deref().unwrap_or("(unnamed)");
+                        println!();
+                        if confirm(&format!("Delete \"{}\"?", display_name))? {
+                            // Backup before delete for undo
+                            let backup = db.get_contact_detail(person.id)?;
+
+                            #[cfg(target_os = "macos")]
+                            if let Some(apple_id) = get_apple_id(person) {
+                                if let Err(e) = delete_from_macos_contacts(&apple_id) {
+                                    eprintln!("Warning: Could not delete from macOS Contacts: {}", e);
+                                }
+                            }
+
+                            if db.delete_person(person.id)? {
+                                // Show undo prompt with 5 second timeout
+                                if let Some(backup) = backup {
+                                    if prompt_undo(&format!("Deleted \"{}\"", display_name), 5)? {
+                                        db.restore_person(&backup)?;
+                                        println!("Restored.");
+                                        // Stay on same contact - don't advance index
+                                    } else {
+                                        // User didn't undo - advance if needed
+                                        if index >= total - 1 && index > 0 {
+                                            index -= 1;
+                                        }
+                                    }
+                                } else {
+                                    println!("Deleted: {}", display_name);
+                                    if index >= total - 1 && index > 0 {
+                                        index -= 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('v') | KeyCode::Char('V') => {
+                        view_mode = ViewMode::Table;
+                        scroll = index.saturating_sub(visible_lines() / 2);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+                        if index + 1 < total {
+                            index += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                        index = index.saturating_sub(1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        index = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        index = total - 1;
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('Q') => {
+                        clear_screen()?;
+                        std::process::exit(0);
+                    }
+                    KeyCode::Char('?') => {
+                        show_help("browse")?;
+                    }
+                    _ => {}
+                }
+            }
+            ViewMode::Table => {
+                // Table view - show list with scrolling
+                let visible = visible_lines();
+
+                // Adjust scroll to keep cursor visible
+                if index < scroll {
+                    scroll = index;
+                } else if index >= scroll + visible {
+                    scroll = index - visible + 1;
                 }
 
-                if db.delete_person(detail.person.id)? {
-                    println!("Deleted: {}", display_name);
+                // Fetch rows for display
+                let rows = db.list_contact_rows(
+                    visible as u32,
+                    scroll as u32,
+                    "sort_name",
+                    "ASC",
+                )?;
+
+                print_table_header();
+                for (i, row) in rows.iter().enumerate() {
+                    let absolute_idx = scroll + i;
+                    print_contact_row(row, absolute_idx == index);
                 }
-                index += 1;
-            }
-            KeyCode::Right | KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter | KeyCode::Char(' ') => {
-                index += 1;
-            }
-            KeyCode::Left => {
-                index = index.saturating_sub(1);
-            }
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                break;
-            }
-            _ => {
-                // Unknown input, stay on same contact
+
+                let status = StatusBar::new()
+                    .counter(index + 1, total)
+                    .action("↑↓", "")
+                    .action("g/G", "")
+                    .action("enter", "")
+                    .action("v", "iew")
+                    .separator()
+                    .action("?", "")
+                    .action("q", "")
+                    .action("Q", "uit")
+                    .render();
+                println!("\n{}", status);
+
+                let code = {
+                    let _guard = RawModeGuard::new()?;
+                    match event::read()? {
+                        Event::Key(KeyEvent { code, .. }) => code,
+                        _ => continue,
+                    }
+                };
+
+                match code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if index + 1 < total {
+                            index += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        index = index.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        index = (index + visible).min(total - 1);
+                    }
+                    KeyCode::PageUp => {
+                        index = index.saturating_sub(visible);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        index = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        index = total - 1;
+                    }
+                    KeyCode::Enter => {
+                        view_mode = ViewMode::Card;
+                    }
+                    KeyCode::Char('v') | KeyCode::Char('V') => {
+                        view_mode = ViewMode::Card;
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('Q') => {
+                        clear_screen()?;
+                        std::process::exit(0);
+                    }
+                    KeyCode::Char('?') => {
+                        show_help("list")?;
+                    }
+                    _ => {}
+                }
             }
         }
     }
 
     clear_screen()?;
-
-    if index >= persons.len() {
-        println!("Reviewed {} contacts.", persons.len());
-    }
-
     Ok(())
 }
 
-/// Handle edit action - prompt for each field
-pub fn handle_edit(
+// ============================================================================
+// Edit Functions
+// ============================================================================
+
+/// Full edit: all fields including work, location, extended name fields
+pub fn handle_full_edit(
     db: &Database,
     detail: &crate::models::ContactDetail,
 ) -> Result<bool> {
-    let person = &detail.person;
-
-    // First name
-    let current_first = person.name_given.as_deref().unwrap_or("");
-    let new_first = match prompt_field("first", Some(current_first))? {
-        FormResult::Value(v) => v,
-        FormResult::Cancelled => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-
-    // Last name
-    let current_last = person.name_family.as_deref().unwrap_or("");
-    let new_last = match prompt_field("last", Some(current_last))? {
-        FormResult::Value(v) => v,
-        FormResult::Cancelled => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-
-    // Email (primary)
-    let current_email = detail
-        .emails
-        .iter()
-        .find(|e| e.is_primary)
-        .or(detail.emails.first())
-        .map(|e| e.email_address.as_str())
-        .unwrap_or("");
-    let new_email = match prompt_field("email", Some(current_email))? {
-        FormResult::Value(v) => v,
-        FormResult::Cancelled => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-
-    // Validate email if changed and not empty
-    if !new_email.is_empty() && new_email != current_email && !is_valid_email(&new_email) {
-        eprintln!("Invalid email format");
-        return Ok(false);
-    }
-
-    // Phone (primary)
-    let current_phone = detail
-        .phones
-        .iter()
-        .find(|p| p.is_primary)
-        .or(detail.phones.first())
-        .map(|p| p.phone_number.as_str())
-        .unwrap_or("");
-    let new_phone = match prompt_field("phone", Some(current_phone))? {
-        FormResult::Value(v) => v,
-        FormResult::Cancelled => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-
-    // Notes
-    let current_notes = person.notes.as_deref().unwrap_or("");
-    let new_notes = match prompt_field("notes", Some(current_notes))? {
-        FormResult::Value(v) => v,
-        FormResult::Cancelled => {
-            println!("Cancelled.");
-            return Ok(false);
-        }
-    };
-
-    // Apply changes
-    let mut updated_person = person.clone();
-    let mut has_changes = false;
-
-    if new_first != current_first {
-        updated_person.name_given = if new_first.is_empty() { None } else { Some(new_first) };
-        has_changes = true;
-    }
-    if new_last != current_last {
-        updated_person.name_family = if new_last.is_empty() { None } else { Some(new_last) };
-        has_changes = true;
-    }
-    if new_notes != current_notes {
-        updated_person.notes = if new_notes.is_empty() { None } else { Some(new_notes) };
-        has_changes = true;
-    }
-
-    // Recompute display names if name changed
-    if updated_person.name_given != person.name_given
-        || updated_person.name_family != person.name_family
-    {
-        updated_person.compute_names();
-    }
-
-    // Update person record if changed
-    if updated_person.name_given != person.name_given
-        || updated_person.name_family != person.name_family
-        || updated_person.notes != person.notes
-    {
-        db.update_person(&updated_person)?;
-    }
-
-    // Handle email update
-    if new_email != current_email {
-        update_primary_email(db, person.id, &new_email, &detail.emails)?;
-        has_changes = true;
-    }
-
-    // Handle phone update
-    if new_phone != current_phone {
-        update_primary_phone(db, person.id, &new_phone, &detail.phones)?;
-        has_changes = true;
-    }
-
-    if has_changes {
-        println!("\nSaved.");
-    }
-
-    Ok(true)
+    // This is the renamed handle_edit_all - comprehensive field editing
+    handle_edit_all(db, detail)
 }
 
 /// Handle edit all fields action - comprehensive field editing
@@ -634,6 +536,45 @@ pub fn handle_edit_all(
 
     let current_suffix = person.name_suffix.as_deref().unwrap_or("");
     let new_suffix = get_field!("suffix", current_suffix);
+
+    let current_preferred = person.preferred_name.as_deref().unwrap_or("");
+    let new_preferred = get_field!("preferred name", current_preferred);
+
+    // Name order selection
+    let name_order_options = ["Western (Given Family)", "Eastern (Family Given)", "Latin"];
+    let current_order_idx = match person.name_order {
+        NameOrder::Eastern => 1,
+        NameOrder::Latin => 2,
+        NameOrder::Western => 0,
+    };
+    println!("name order [{}]: ", name_order_options[current_order_idx]);
+    let new_name_order = match select("", &name_order_options)? {
+        Some(idx) => match idx {
+            1 => NameOrder::Eastern,
+            2 => NameOrder::Latin,
+            _ => NameOrder::Western,
+        },
+        None => person.name_order, // Keep current on cancel
+    };
+
+    // Person type selection
+    let person_type_options = ["Personal", "Business", "Prospect", "Connector"];
+    let current_type_idx = match person.person_type {
+        PersonType::Business => 1,
+        PersonType::Prospect => 2,
+        PersonType::Connector => 3,
+        PersonType::Personal => 0,
+    };
+    println!("contact type [{}]: ", person_type_options[current_type_idx]);
+    let new_person_type = match select("", &person_type_options)? {
+        Some(idx) => match idx {
+            1 => PersonType::Business,
+            2 => PersonType::Prospect,
+            3 => PersonType::Connector,
+            _ => PersonType::Personal,
+        },
+        None => person.person_type, // Keep current on cancel
+    };
 
     // Organization fields
     let (current_company, current_title, current_dept) = detail
@@ -676,9 +617,112 @@ pub fn handle_edit_all(
         new_phones.push((phone.id, new_val, type_label.to_string()));
     }
 
+    // Addresses - edit each one
+    struct AddressEdit {
+        street: String,
+        city: String,
+        state: String,
+        postal_code: String,
+        country: String,
+    }
+    let mut new_addresses: Vec<AddressEdit> = Vec::new();
+    for addr in &detail.addresses {
+        let type_label = addr.address_type.as_str();
+        println!("\n--- Address ({}) ---", type_label);
+
+        let current_street = addr.street.as_deref().unwrap_or("");
+        let new_street = get_field!("street", current_street);
+
+        let current_city = addr.city.as_deref().unwrap_or("");
+        let new_city = get_field!("city", current_city);
+
+        let current_state = addr.state.as_deref().unwrap_or("");
+        let new_state = get_field!("state", current_state);
+
+        let current_postal = addr.postal_code.as_deref().unwrap_or("");
+        let new_postal = get_field!("postal code", current_postal);
+
+        let current_country = addr.country.as_deref().unwrap_or("");
+        let new_country = get_field!("country", current_country);
+
+        new_addresses.push(AddressEdit {
+            street: new_street,
+            city: new_city,
+            state: new_state,
+            postal_code: new_postal,
+            country: new_country,
+        });
+    }
+
     // Notes
     let current_notes = person.notes.as_deref().unwrap_or("");
     let new_notes = get_field!("notes", current_notes);
+
+    // Photo - show status and offer to change
+    let has_photo = photo_utils::photo_exists(person.id);
+    let photo_status = if has_photo { "has photo" } else { "no photo" };
+    println!("photo [{}]: ", photo_status);
+
+    let photo_options = if has_photo {
+        vec!["Keep current", "Replace photo", "Clear photo"]
+    } else {
+        vec!["No photo", "Add photo"]
+    };
+
+    let mut photo_changed = false;
+    if let Some(choice) = select("", &photo_options)? {
+        if has_photo {
+            match choice {
+                1 => {
+                    // Replace photo - open file picker
+                    if let Some(path) = FileDialog::new()
+                        .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"])
+                        .set_title("Select photo for contact")
+                        .pick_file()
+                    {
+                        match photo_utils::save_photo(person.id, &path) {
+                            Ok(()) => {
+                                println!("Photo updated.");
+                                photo_changed = true;
+                            }
+                            Err(e) => eprintln!("Failed to save photo: {}", e),
+                        }
+                    }
+                }
+                2 => {
+                    // Clear photo
+                    photo_utils::delete_photo(person.id);
+                    println!("Photo cleared.");
+                    photo_changed = true;
+                }
+                _ => {} // Keep current
+            }
+        } else if choice == 1 {
+            // Add photo - open file picker
+            if let Some(path) = FileDialog::new()
+                .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"])
+                .set_title("Select photo for contact")
+                .pick_file()
+            {
+                match photo_utils::save_photo(person.id, &path) {
+                    Ok(()) => {
+                        println!("Photo added.");
+                        photo_changed = true;
+                    }
+                    Err(e) => eprintln!("Failed to save photo: {}", e),
+                }
+            }
+        }
+    }
+
+    // AI contact permission toggle
+    let ai_status = if person.ai_contact_allowed { "allowed" } else { "blocked" };
+    println!("allow AI contact [{}]: ", ai_status);
+    let ai_options = ["Allow", "Don't allow"];
+    let new_ai_contact_allowed = match select("", &ai_options)? {
+        Some(idx) => idx == 0,
+        None => person.ai_contact_allowed, // Keep current on cancel
+    };
 
     // Apply person changes
     let mut updated_person = person.clone();
@@ -708,25 +752,42 @@ pub fn handle_edit_all(
         updated_person.name_suffix = non_empty(new_suffix);
         has_changes = true;
     }
+    if new_preferred != current_preferred {
+        updated_person.preferred_name = non_empty(new_preferred.to_string());
+        has_changes = true;
+    }
+    if new_name_order != person.name_order {
+        updated_person.name_order = new_name_order;
+        has_changes = true;
+    }
+    if new_person_type != person.person_type {
+        updated_person.person_type = new_person_type;
+        has_changes = true;
+    }
     if new_notes != current_notes {
         updated_person.notes = non_empty(new_notes);
         has_changes = true;
     }
+    if new_ai_contact_allowed != person.ai_contact_allowed {
+        updated_person.ai_contact_allowed = new_ai_contact_allowed;
+        has_changes = true;
+    }
 
-    // Recompute display names if any name field changed
+    // Recompute display names if any name field or name_order changed
     let name_changed = updated_person.name_prefix != person.name_prefix
         || updated_person.name_given != person.name_given
         || updated_person.name_middle != person.name_middle
         || updated_person.name_family != person.name_family
         || updated_person.name_suffix != person.name_suffix
-        || updated_person.name_nickname != person.name_nickname;
+        || updated_person.name_nickname != person.name_nickname
+        || updated_person.name_order != person.name_order;
 
     if name_changed {
         updated_person.compute_names();
     }
 
     // Update person record if changed
-    if name_changed || updated_person.notes != person.notes {
+    if has_changes {
         db.update_person(&updated_person)?;
     }
 
@@ -771,7 +832,28 @@ pub fn handle_edit_all(
         }
     }
 
-    if has_changes {
+    // Handle address updates
+    for (i, new_addr) in new_addresses.iter().enumerate() {
+        let original = &detail.addresses[i];
+        let changed = new_addr.street != original.street.as_deref().unwrap_or("")
+            || new_addr.city != original.city.as_deref().unwrap_or("")
+            || new_addr.state != original.state.as_deref().unwrap_or("")
+            || new_addr.postal_code != original.postal_code.as_deref().unwrap_or("")
+            || new_addr.country != original.country.as_deref().unwrap_or("");
+
+        if changed {
+            let mut updated_addr = original.clone();
+            updated_addr.street = non_empty(new_addr.street.clone());
+            updated_addr.city = non_empty(new_addr.city.clone());
+            updated_addr.state = non_empty(new_addr.state.clone());
+            updated_addr.postal_code = non_empty(new_addr.postal_code.clone());
+            updated_addr.country = non_empty(new_addr.country.clone());
+            db.update_address(&updated_addr)?;
+            has_changes = true;
+        }
+    }
+
+    if has_changes || photo_changed {
         println!("\nSaved.");
     }
 
@@ -810,65 +892,6 @@ pub fn handle_notes(
         println!("\nSaved.");
     }
 
-    Ok(())
-}
-
-/// Update primary email for a person
-fn update_primary_email(
-    db: &Database,
-    person_id: uuid::Uuid,
-    new_email: &str,
-    existing_emails: &[Email],
-) -> Result<()> {
-    // Find primary or first email to update, or insert new
-    let to_update = existing_emails
-        .iter()
-        .find(|e| e.is_primary)
-        .or(existing_emails.first());
-
-    if new_email.is_empty() {
-        // Don't delete existing email, just leave it
-        return Ok(());
-    }
-
-    if let Some(existing) = to_update {
-        let mut updated = existing.clone();
-        updated.email_address = new_email.to_string();
-        db.update_email(&updated)?;
-    } else {
-        let mut email = Email::new(person_id, new_email.to_string());
-        email.is_primary = true;
-        db.insert_email(&email)?;
-    }
-    Ok(())
-}
-
-/// Update primary phone for a person
-fn update_primary_phone(
-    db: &Database,
-    person_id: uuid::Uuid,
-    new_phone: &str,
-    existing_phones: &[Phone],
-) -> Result<()> {
-    let to_update = existing_phones
-        .iter()
-        .find(|p| p.is_primary)
-        .or(existing_phones.first());
-
-    if new_phone.is_empty() {
-        // Don't delete existing phone, just leave it
-        return Ok(());
-    }
-
-    if let Some(existing) = to_update {
-        let mut updated = existing.clone();
-        updated.phone_number = new_phone.to_string();
-        db.update_phone(&updated)?;
-    } else {
-        let mut phone = Phone::new(person_id, new_phone.to_string());
-        phone.is_primary = true;
-        db.insert_phone(&phone)?;
-    }
     Ok(())
 }
 

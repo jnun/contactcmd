@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
+pub mod gateway;
+pub mod learn;
 mod persons;
 mod schema;
 
@@ -86,6 +88,87 @@ impl Database {
             self.set_schema_version(3)?;
         }
 
+        if self.get_schema_version()? == 3 {
+            // V3 → V4: Add app_settings table
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V4))?;
+            self.set_schema_version(4)?;
+        }
+
+        if self.get_schema_version()? == 4 {
+            // V4 → V5: Add oauth_tokens table
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V5))?;
+            self.set_schema_version(5)?;
+        }
+
+        if self.get_schema_version()? == 5 {
+            // V5 → V6: Add tasks table
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V6))?;
+            self.set_schema_version(6)?;
+        }
+
+        if self.get_schema_version()? == 6 {
+            // V6 → V7: Add gateway tables (api_keys + communication_queue)
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V7))?;
+            self.set_schema_version(7)?;
+        }
+
+        if self.get_schema_version()? == 7 {
+            // V7 → V8: Add checkin_date column to persons
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V8))?;
+            self.set_schema_version(8)?;
+        }
+
+        if self.get_schema_version()? == 8 {
+            // V8 → V9: Add learn_something table for progressive feature discovery
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V9))?;
+            self.set_schema_version(9)?;
+            // Seed initial tutorials
+            self.seed_learn_something()?;
+        }
+
+        if self.get_schema_version()? == 9 {
+            // V9 → V10: Add rate limiting columns to api_keys
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V10))?;
+            self.set_schema_version(10)?;
+        }
+
+        if self.get_schema_version()? == 10 {
+            // V10 → V11: Add recipient allowlist table
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V11))?;
+            self.set_schema_version(11)?;
+        }
+
+        if self.get_schema_version()? == 11 {
+            // V11 → V12: Add content_filters table for message safety screening
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V12))?;
+            self.set_schema_version(12)?;
+            // Seed default content filters
+            self.seed_content_filters()?;
+        }
+
+        if self.get_schema_version()? == 12 {
+            // V12 → V13: Add webhook_url column to api_keys
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V13))?;
+            self.set_schema_version(13)?;
+        }
+
+        if self.get_schema_version()? == 13 {
+            // V13 → V14: Add ai_contact_allowed column to persons
+            self.conn
+                .execute_batch(&format!("BEGIN TRANSACTION; {} COMMIT;", schema::MIGRATION_V14))?;
+            self.set_schema_version(14)?;
+        }
+
         Ok(())
     }
 
@@ -154,6 +237,110 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // App settings methods
+
+    /// Get an app setting by key
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT value FROM app_settings WHERE key = ?",
+            [key],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set an app setting (insert or update)
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an app setting
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM app_settings WHERE key = ?", [key])?;
+        Ok(())
+    }
+
+    // OAuth token methods
+
+    /// Store OAuth tokens for a provider
+    pub fn save_oauth_token(
+        &self,
+        provider: &str,
+        email: &str,
+        refresh_token: &str,
+        access_token: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO oauth_tokens (provider, email, refresh_token, access_token, expires_at)
+             VALUES (?, ?, ?, ?, ?)",
+            rusqlite::params![provider, email, refresh_token, access_token, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Get OAuth tokens for a provider
+    pub fn get_oauth_token(&self, provider: &str) -> Result<Option<OAuthToken>> {
+        let result = self.conn.query_row(
+            "SELECT email, refresh_token, access_token, expires_at FROM oauth_tokens WHERE provider = ?",
+            [provider],
+            |row| {
+                Ok(OAuthToken {
+                    email: row.get(0)?,
+                    refresh_token: row.get(1)?,
+                    access_token: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(token) => Ok(Some(token)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update access token and expiry for a provider
+    pub fn update_oauth_access_token(
+        &self,
+        provider: &str,
+        access_token: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE oauth_tokens SET access_token = ?, expires_at = ? WHERE provider = ?",
+            rusqlite::params![access_token, expires_at, provider],
+        )?;
+        Ok(())
+    }
+
+    /// Delete OAuth tokens for a provider
+    pub fn delete_oauth_token(&self, provider: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM oauth_tokens WHERE provider = ?", [provider])?;
+        Ok(())
+    }
+}
+
+/// OAuth token data
+#[derive(Debug, Clone)]
+pub struct OAuthToken {
+    pub email: String,
+    pub refresh_token: String,
+    pub access_token: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
 #[cfg(test)]
@@ -190,5 +377,33 @@ mod tests {
         assert!(tables.contains(&"special_dates".to_string()));
         assert!(tables.contains(&"notes".to_string()));
         assert!(tables.contains(&"interactions".to_string()));
+        assert!(tables.contains(&"app_settings".to_string()));
+        assert!(tables.contains(&"content_filters".to_string()));
+    }
+
+    #[test]
+    fn test_app_settings() {
+        let db = Database::open_memory().unwrap();
+
+        // Initially no setting
+        assert!(db.get_setting("email_account").unwrap().is_none());
+
+        // Set a setting
+        db.set_setting("email_account", "test@example.com").unwrap();
+        assert_eq!(
+            db.get_setting("email_account").unwrap(),
+            Some("test@example.com".to_string())
+        );
+
+        // Update a setting
+        db.set_setting("email_account", "new@example.com").unwrap();
+        assert_eq!(
+            db.get_setting("email_account").unwrap(),
+            Some("new@example.com".to_string())
+        );
+
+        // Delete a setting
+        db.delete_setting("email_account").unwrap();
+        assert!(db.get_setting("email_account").unwrap().is_none());
     }
 }

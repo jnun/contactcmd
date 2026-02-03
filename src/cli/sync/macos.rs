@@ -134,11 +134,16 @@ pub fn run_sync_mac(db: &Database, dry_run: bool) -> Result<()> {
     } else {
         println!("Sync complete: {} created, {} updated, {} skipped",
                  created, updated, skipped);
+    }
 
-        // Offer to sync photos
-        if should_sync_photos() {
-            sync_photos(db, &contacts)?;
+    // Offer to sync photos (even during dry-run)
+    match prompt_photo_sync() {
+        PhotoSyncMode::Skip => {}
+        PhotoSyncMode::DryRun => sync_photos(db, &contacts, true)?,
+        PhotoSyncMode::Sync if dry_run => {
+            println!("Cannot sync photos during contact dry-run. Use 'd' to preview photo sync.");
         }
+        PhotoSyncMode::Sync => sync_photos(db, &contacts, false)?,
     }
 
     Ok(())
@@ -603,29 +608,48 @@ pub fn get_apple_id(person: &Person) -> Option<String> {
     parsed.get("apple").cloned()
 }
 
+/// Photo sync mode chosen by user
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotoSyncMode {
+    Skip,
+    DryRun,
+    Sync,
+}
+
 /// Prompt user to sync photos
-fn should_sync_photos() -> bool {
+fn prompt_photo_sync() -> PhotoSyncMode {
     use std::io::{self, Write};
 
-    print!("\nSync photos? [y/N]: ");
+    print!("\nSync photos? [y/N/d(ry-run)]: ");
     let _ = io::stdout().flush();
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
-        return false;
+        return PhotoSyncMode::Skip;
     }
 
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => PhotoSyncMode::Sync,
+        "d" | "dry" | "dry-run" => PhotoSyncMode::DryRun,
+        _ => PhotoSyncMode::Skip,
+    }
 }
 
 /// Sync photos from macOS Contacts
-fn sync_photos(db: &Database, contacts: &NSArray<CNContact>) -> Result<()> {
+fn sync_photos(db: &Database, contacts: &NSArray<CNContact>, dry_run: bool) -> Result<()> {
+    use photo_utils::SaveResult;
+
     let total = contacts.count();
 
-    println!("Syncing photos...");
+    if dry_run {
+        println!("Photo sync dry run...");
+    } else {
+        println!("Syncing photos...");
+    }
 
     let mut synced = 0;
-    let mut skipped = 0;
+    let mut unchanged = 0;
+    let mut no_photo = 0;
 
     for i in 0..total {
         let contact = contacts.objectAtIndex(i);
@@ -639,7 +663,7 @@ fn sync_photos(db: &Database, contacts: &NSArray<CNContact>) -> Result<()> {
         let image_data = unsafe { contact.imageData() };
 
         let Some(data) = image_data else {
-            skipped += 1;
+            no_photo += 1;
             continue;
         };
 
@@ -647,7 +671,7 @@ fn sync_photos(db: &Database, contacts: &NSArray<CNContact>) -> Result<()> {
         let person = match db.find_person_by_external_id("apple", &apple_id)? {
             Some(p) => p,
             None => {
-                skipped += 1;
+                no_photo += 1;
                 continue;
             }
         };
@@ -656,28 +680,46 @@ fn sync_photos(db: &Database, contacts: &NSArray<CNContact>) -> Result<()> {
         let image_bytes = data.to_vec();
 
         if image_bytes.is_empty() {
-            skipped += 1;
+            no_photo += 1;
             continue;
         }
 
-        // Save as JPEG (validates and converts)
-        if photo_utils::save_photo_bytes(person.id, &image_bytes).is_err() {
-            skipped += 1;
-            continue;
+        if dry_run {
+            // Check what would happen without saving
+            match photo_utils::would_photo_change(person.id, &image_bytes) {
+                SaveResult::Saved => synced += 1,
+                SaveResult::Unchanged => unchanged += 1,
+                SaveResult::Invalid => no_photo += 1,
+            }
+        } else {
+            // Save with change detection
+            match photo_utils::save_photo_bytes_if_changed(person.id, &image_bytes) {
+                SaveResult::Saved => synced += 1,
+                SaveResult::Unchanged => unchanged += 1,
+                SaveResult::Invalid => no_photo += 1,
+            }
         }
-
-        synced += 1;
 
         // Progress indicator every 50 contacts
-        if synced % 50 == 0 {
-            eprint!("\rSyncing photos... {}", synced);
+        if (synced + unchanged) % 50 == 0 && (synced + unchanged) > 0 {
+            eprint!("\rProcessing photos... {}", synced + unchanged);
         }
     }
 
-    if synced >= 50 {
+    if synced + unchanged >= 50 {
         eprint!("\r                          \r"); // Clear progress line
     }
 
-    println!("Photo sync complete: {} synced, {} without photos", synced, skipped);
+    if dry_run {
+        println!(
+            "Dry run complete: {} would sync, {} unchanged, {} without photos",
+            synced, unchanged, no_photo
+        );
+    } else {
+        println!(
+            "Photo sync complete: {} synced, {} unchanged, {} without photos",
+            synced, unchanged, no_photo
+        );
+    }
     Ok(())
 }

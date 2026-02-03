@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
+use imessage_database::util::streamtyped::parse as parse_typedstream;
 use rusqlite::{Connection, OpenFlags};
 use std::io::Write;
 use std::path::PathBuf;
@@ -88,121 +89,6 @@ fn apple_timestamp_to_datetime(timestamp: i64) -> DateTime<Local> {
         .unwrap_or_else(Local::now)
 }
 
-/// Known NSClass names to filter out when extracting text from attributedBody blobs
-const NS_CLASS_NAMES: &[&str] = &[
-    "NSString", "NSDictionary", "NSNumber", "NSArray", "NSData",
-    "NSValue", "NSNull", "NSMutableString", "NSMutableDictionary",
-    "NSMutableArray", "NSMutableData", "NSAttributedString",
-    "NSMutableAttributedString", "NSParagraphStyle",
-    "NSMutableParagraphStyle", "NSFont", "NSColor",
-    "__NSCFString", "__NSCFDictionary", "__NSCFArray",
-    "__NSCFNumber", "__NSCFBoolean", "__NSCFData",
-    "NSUUID", "NSURL", "NSDate", "NSObject",
-    "NSShadow", "NSUnderlineStyle", "NSRange", "NSSet", "NSMutableSet",
-    "NSPresentationIntent", "NSPresentationIntentTableColumn",
-    "WNSValue", "WNSArray", "WNSString", "WNSDictionary",
-];
-
-/// Check if a string is an iMessage attachment reference (e.g. "at_0_9FBE0289-...")
-fn is_attachment_ref(s: &str) -> bool {
-    // Pattern: "at_" + digit(s) + "_" + UUID-like hex/dashes
-    if let Some(rest) = s.strip_prefix("at_") {
-        // Find the next underscore after the digits
-        if let Some(pos) = rest.find('_') {
-            let digits = &rest[..pos];
-            let after = &rest[pos + 1..];
-            return !digits.is_empty()
-                && digits.chars().all(|c| c.is_ascii_digit())
-                && !after.is_empty()
-                && after.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-        }
-    }
-    false
-}
-
-/// Extract readable text from an attributedBody blob.
-///
-/// Modern iMessages store the message content in an NSArchiver blob rather than
-/// the `text` column. This function finds the longest printable ASCII/UTF-8
-/// segment in the blob, filtering out known Cocoa class names.
-pub fn extract_text_from_body(blob: &[u8]) -> Option<String> {
-    if blob.is_empty() {
-        return None;
-    }
-
-    // Find all runs of printable characters (including common Unicode)
-    let mut segments: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    for &byte in blob {
-        // Accept printable ASCII range plus common extended chars
-        if (0x20..0x7F).contains(&byte) {
-            current.push(byte as char);
-        } else if !current.is_empty() {
-            segments.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-
-    // Filter out known NS class names and very short segments
-    let filtered: Vec<&String> = segments.iter()
-        .filter(|s| s.len() >= 2)
-        .filter(|s| !NS_CLASS_NAMES.contains(&s.as_str()))
-        .filter(|s| {
-            // Filter out common binary artifact patterns
-            let trimmed = s.trim();
-            !trimmed.is_empty()
-                && !trimmed.chars().all(|c| matches!(c, '+' | '.' | '#' | '@' | '\'' | '(' | ')' | '*' | ',' | ';' | ':'))
-                && !trimmed.starts_with("streamtyped")
-                && !trimmed.starts_with("NSKeyedArchiver")
-                && !trimmed.starts_with("$class")
-                && !trimmed.starts_with("NS.keys")
-                && !trimmed.starts_with("NS.objects")
-                && !trimmed.starts_with("NS.string")
-                && !trimmed.starts_with("NS.bytes")
-                && !trimmed.starts_with("NS.time")
-                && !trimmed.starts_with("NS.base")
-                && !trimmed.starts_with("NS.length")
-                && !trimmed.starts_with("NS.special")
-                && !trimmed.starts_with("$classname")
-                && !trimmed.starts_with("$classes")
-                && !trimmed.starts_with("$null")
-                && !trimmed.starts_with("NSStoreModelVersionHashes")
-                && !is_attachment_ref(trimmed)
-                // Also filter strings containing binary plist markers anywhere
-                && !trimmed.contains("$version")
-                && !trimmed.contains("$archiver")
-                && !trimmed.contains("$objects")
-                && !trimmed.contains("$top")
-                && !trimmed.contains("$class")
-                && !trimmed.contains("NSValue")
-                && !trimmed.contains("NSString")
-                && !trimmed.contains("NSNumber")
-                && !trimmed.contains("NSArray")
-                && !trimmed.contains("NSDictionary")
-                && !trimmed.contains("NSData")
-                && !trimmed.contains("__kIM")
-                && !trimmed.contains("__kCF")
-                && !trimmed.contains("__NS")
-                && !trimmed.starts_with("__k")
-                && !trimmed.starts_with("_NS")
-                && !trimmed.starts_with("WNS")
-                && !trimmed.contains("NSObject")
-                && !trimmed.contains("AttributeName")
-                && !trimmed.contains("PartAttribute")
-        })
-        .collect();
-
-    // Filter out binary plist text, then return the longest remaining segment
-    filtered.into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .filter(|s| !is_binary_plist_text(s))
-        .max_by_key(|s| s.len())
-}
-
 /// Open the Messages database, returning None if unavailable
 fn open_messages_db() -> Result<Option<Connection>> {
     let db_path = messages_db_path();
@@ -223,45 +109,22 @@ fn open_messages_db() -> Result<Option<Connection>> {
     }
 }
 
-/// Check if text looks like binary plist/NSKeyedArchiver data stored as string
-fn is_binary_plist_text(text: &str) -> bool {
-    // NSKeyedArchiver format markers
-    if text.contains("$archiver") || text.contains("$version") || text.contains("$objects") {
-        return true;
-    }
-    // Binary plist signature
-    if text.starts_with("bplist") {
-        return true;
-    }
-    // iMessage internal attribute markers
-    if text.contains("__kIM") || text.contains("__kCF") || text.contains("__NS") {
-        return true;
-    }
-    // WNS (wrapped NS) class markers
-    if text.contains("WNSValue") || text.contains("WNSArray") || text.contains("WNSString") {
-        return true;
-    }
-    // High ratio of non-printable characters suggests binary data
-    let non_printable = text.chars().filter(|c| !c.is_ascii_graphic() && !c.is_whitespace()).count();
-    let total = text.len();
-    if total > 10 && non_printable > total / 4 {
-        return true;
-    }
-    false
-}
-
 /// Extract text from a message row, trying `text` column first, then `attributedBody`
 fn extract_message_text(text: Option<String>, attributed_body: Option<Vec<u8>>) -> Option<String> {
     // Prefer the text column if it has readable content
     if let Some(ref t) = text {
-        if !t.is_empty() && !is_binary_plist_text(t) {
+        if !t.is_empty() {
             return Some(t.clone());
         }
     }
 
-    // Fall back to extracting from attributedBody blob
-    if let Some(ref blob) = attributed_body {
-        return extract_text_from_body(blob);
+    // Fall back to parsing attributedBody blob with proper typedstream parser
+    if let Some(blob) = attributed_body {
+        if let Ok(parsed) = parse_typedstream(blob) {
+            if !parsed.is_empty() {
+                return Some(parsed);
+            }
+        }
     }
 
     None
@@ -270,6 +133,184 @@ fn extract_message_text(text: Option<String>, attributed_body: Option<Vec<u8>>) 
 /// Query the Messages database for the most recent message matching any of the given phone numbers
 pub fn get_last_message_for_phones(phones: &[String]) -> Result<Option<LastMessage>> {
     get_last_message_for_handles(phones, &[])
+}
+
+/// Service type detected from chat history
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedService {
+    IMessage,
+    Sms,
+    Unknown,
+}
+
+/// A recent message handle with metadata
+#[derive(Debug, Clone)]
+pub struct RecentHandle {
+    pub handle: String,
+    pub last_message_date: DateTime<Local>,
+    pub service: DetectedService,
+}
+
+/// Detect the appropriate messaging service for a phone number based on chat history.
+/// Returns the service type used in the most recent conversation with this number.
+pub fn detect_service_for_phone(phone: &str) -> Result<DetectedService> {
+    let conn = match open_messages_db()? {
+        Some(c) => c,
+        None => return Ok(DetectedService::Unknown),
+    };
+
+    // Build handle patterns for this phone
+    let handle_patterns = phone_handle_patterns(phone);
+    if handle_patterns.is_empty() {
+        return Ok(DetectedService::Unknown);
+    }
+
+    // Query for the most recent chat with this handle to get the service type
+    // Join chat -> chat_handle_join -> handle to find chats for this recipient
+    let placeholders: Vec<String> = handle_patterns.iter().map(|_| "LOWER(h.id) = LOWER(?)".to_string()).collect();
+    let query = format!(
+        r#"SELECT c.service_name, c.last_read_message_timestamp
+           FROM chat c
+           INNER JOIN chat_handle_join chj ON c.ROWID = chj.chat_id
+           INNER JOIN handle h ON chj.handle_id = h.ROWID
+           WHERE ({})
+           ORDER BY c.last_read_message_timestamp DESC
+           LIMIT 1"#,
+        placeholders.join(" OR ")
+    );
+
+    let mut stmt = match conn.prepare(&query) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(DetectedService::Unknown);
+            }
+            return Err(e).context("Failed to query chat service");
+        }
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = handle_patterns
+        .iter()
+        .map(|p| p as &dyn rusqlite::ToSql)
+        .collect();
+
+    let result = stmt.query_row(param_refs.as_slice(), |row| {
+        row.get::<_, String>(0)
+    });
+
+    match result {
+        Ok(service_name) => {
+            let service_lower = service_name.to_lowercase();
+            if service_lower.contains("imessage") {
+                Ok(DetectedService::IMessage)
+            } else if service_lower.contains("sms") {
+                Ok(DetectedService::Sms)
+            } else {
+                Ok(DetectedService::Unknown)
+            }
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(DetectedService::Unknown),
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(DetectedService::Unknown);
+            }
+            Err(e).context("Failed to detect service")
+        }
+    }
+}
+
+/// Get all unique handles with recent messages in the last N days
+///
+/// Returns handles sorted by most recent message date (descending)
+pub fn get_recent_message_handles(days: u32) -> Result<Vec<RecentHandle>> {
+    let conn = match open_messages_db()? {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+
+    // Calculate the cutoff timestamp (days ago in Apple's nanosecond format)
+    let now = Local::now();
+    let cutoff = now - chrono::Duration::days(days as i64);
+    let cutoff_unix = cutoff.timestamp();
+    const APPLE_EPOCH_OFFSET: i64 = 978307200;
+    let cutoff_apple_seconds = cutoff_unix - APPLE_EPOCH_OFFSET;
+    // Modern messages use nanoseconds
+    let cutoff_apple_ns = cutoff_apple_seconds * 1_000_000_000;
+
+    // Query for unique handles with their most recent message and service type
+    // Join through chat_message_join -> chat -> chat_handle_join -> handle for service info
+    let query = r#"
+        SELECT
+            h.id as handle,
+            MAX(m.date) as last_date,
+            (SELECT c.service_name
+             FROM chat c
+             INNER JOIN chat_handle_join chj ON c.ROWID = chj.chat_id
+             WHERE chj.handle_id = h.ROWID
+             ORDER BY c.last_read_message_timestamp DESC
+             LIMIT 1) as service_name
+        FROM message m
+        INNER JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.date >= ?
+        GROUP BY h.id
+        ORDER BY last_date DESC
+    "#;
+
+    let mut stmt = match conn.prepare(query) {
+        Ok(s) => s,
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("locked") || err_str.contains("encrypted") {
+                return Ok(vec![]);
+            }
+            return Err(e).context("Failed to query recent handles");
+        }
+    };
+
+    let rows = stmt.query_map([cutoff_apple_ns], |row| {
+        let handle: String = row.get(0)?;
+        let date: i64 = row.get(1)?;
+        let service_name: Option<String> = row.get(2)?;
+
+        let service = match service_name {
+            Some(s) => {
+                let s_lower = s.to_lowercase();
+                if s_lower.contains("imessage") {
+                    DetectedService::IMessage
+                } else if s_lower.contains("sms") {
+                    DetectedService::Sms
+                } else {
+                    DetectedService::Unknown
+                }
+            }
+            None => DetectedService::Unknown,
+        };
+
+        Ok((handle, date, service))
+    })?;
+
+    let mut results = Vec::new();
+    for row_result in rows {
+        match row_result {
+            Ok((handle, date, service)) => {
+                results.push(RecentHandle {
+                    handle,
+                    last_message_date: apple_timestamp_to_datetime(date),
+                    service,
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Ok(results)
+}
+
+/// Make phones_match public for use by other modules
+pub fn phones_match_public(phone1: &str, phone2: &str) -> bool {
+    phones_match(phone1, phone2)
 }
 
 /// Generate possible handle formats for a phone number
@@ -1083,57 +1124,24 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_text_from_body_with_message() {
-        // Simulate an NSKeyedArchiver blob with message text embedded
-        let mut blob: Vec<u8> = Vec::new();
-        // Binary preamble
-        blob.extend_from_slice(b"\x04\x0b\x01\x00");
-        blob.extend_from_slice(b"streamtyped");
-        blob.extend_from_slice(&[0x00, 0x01, 0x02]);
-        blob.extend_from_slice(b"NSMutableAttributedString");
-        blob.extend_from_slice(&[0x00, 0x03, 0x04]);
-        blob.extend_from_slice(b"NSAttributedString");
-        blob.extend_from_slice(&[0x00, 0x05, 0x06]);
-        // The actual message text
-        blob.extend_from_slice(b"Hey Jason. Are you able to push to 10?");
-        blob.extend_from_slice(&[0x00, 0x07, 0x08]);
-        blob.extend_from_slice(b"NSDictionary");
-        blob.extend_from_slice(&[0x00, 0x09, 0x0A]);
-
-        let result = extract_text_from_body(&blob);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "Hey Jason. Are you able to push to 10?");
+    fn test_extract_message_text_prefers_text_column() {
+        // When text column has content, use it directly
+        let result = extract_message_text(Some("Hello world".to_string()), None);
+        assert_eq!(result, Some("Hello world".to_string()));
     }
 
     #[test]
-    fn test_extract_text_from_body_empty() {
-        assert!(extract_text_from_body(&[]).is_none());
+    fn test_extract_message_text_empty_text_falls_back() {
+        // Empty text column should fall back to attributedBody (returns None if blob also empty/invalid)
+        let result = extract_message_text(Some("".to_string()), None);
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_extract_text_from_body_no_printable() {
-        let blob = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
-        assert!(extract_text_from_body(&blob).is_none());
-    }
-
-    #[test]
-    fn test_is_binary_plist_text_with_archiver_markers() {
-        // NSKeyedArchiver format with $archiver marker
-        assert!(is_binary_plist_text("X$versionY$archiverT$topX$objects"));
-        assert!(is_binary_plist_text("something$versionother"));
-        assert!(is_binary_plist_text("data$objectsmore"));
-    }
-
-    #[test]
-    fn test_is_binary_plist_text_with_bplist() {
-        assert!(is_binary_plist_text("bplist00\x00\x01\x02"));
-    }
-
-    #[test]
-    fn test_is_binary_plist_text_normal_text() {
-        assert!(!is_binary_plist_text("Hello, how are you?"));
-        assert!(!is_binary_plist_text("Meeting at 3pm tomorrow"));
-        assert!(!is_binary_plist_text(""));
+    fn test_extract_message_text_none_inputs() {
+        // Both None should return None
+        let result = extract_message_text(None, None);
+        assert!(result.is_none());
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Person {
     pub updated_at: DateTime<Utc>,
     pub is_dirty: bool,
     pub external_ids: Option<String>,
+    pub checkin_date: Option<DateTime<Utc>>,
+    pub ai_contact_allowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -105,6 +107,8 @@ impl Person {
             updated_at: now,
             is_dirty: false,
             external_ids: None,
+            checkin_date: None,
+            ai_contact_allowed: true,
         }
     }
 

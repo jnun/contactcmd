@@ -1,4 +1,4 @@
-use crate::models::ContactDetail;
+use crate::models::{ContactDetail, Task};
 use super::messages::LastMessage;
 use super::photo_utils;
 use chrono::{Datelike, Local, Timelike};
@@ -27,6 +27,15 @@ fn display_photo(person_id: Uuid) {
 
 /// Print a full contact detail with clean formatting (only non-empty fields)
 pub fn print_full_contact(detail: &ContactDetail, last_message: Option<&LastMessage>) {
+    print_full_contact_with_tasks(detail, last_message, &[]);
+}
+
+/// Print a full contact detail with optional pending tasks preview
+pub fn print_full_contact_with_tasks(
+    detail: &ContactDetail,
+    last_message: Option<&LastMessage>,
+    pending_tasks: &[Task],
+) {
     let person = &detail.person;
     let display_name = person
         .display_name
@@ -72,6 +81,24 @@ pub fn print_full_contact(detail: &ContactDetail, last_message: Option<&LastMess
                 notes.clone()
             };
             println!("  {}", truncated);
+        }
+    }
+
+    // AI contact status (only show if disabled)
+    if !person.ai_contact_allowed {
+        println!("  [AI contact: disabled]");
+    }
+
+    // Pending Tasks (up to 2)
+    if !pending_tasks.is_empty() {
+        println!();
+        for task in pending_tasks.iter().take(2) {
+            let q_label = format!("Q{}", task.quadrant);
+            let title = truncate_message(&task.title, 45);
+            println!("  [ ] {} {}", q_label, title);
+        }
+        if pending_tasks.len() > 2 {
+            println!("  ... +{} more", pending_tasks.len() - 2);
         }
     }
 

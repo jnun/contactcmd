@@ -8,7 +8,7 @@
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage};
+pub use macos::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage, detect_service_for_phone, DetectedService, get_recent_message_handles, RecentHandle, phones_match_public};
 
 #[cfg(not(target_os = "macos"))]
 mod stub {
@@ -21,6 +21,14 @@ mod stub {
         pub date: chrono::DateTime<chrono::Local>,
         pub is_from_me: bool,
         pub handle: String,
+    }
+
+    /// Service type detected from chat history
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DetectedService {
+        IMessage,
+        Sms,
+        Unknown,
     }
 
     /// Stub implementation for non-macOS platforms - always returns None
@@ -48,7 +56,30 @@ mod stub {
         println!("Messages search is only available on macOS.");
         Ok(())
     }
+
+    /// Stub implementation for non-macOS platforms - always returns Unknown
+    pub fn detect_service_for_phone(_phone: &str) -> Result<DetectedService> {
+        Ok(DetectedService::Unknown)
+    }
+
+    /// A recent message handle with metadata
+    #[derive(Debug, Clone)]
+    pub struct RecentHandle {
+        pub handle: String,
+        pub last_message_date: chrono::DateTime<chrono::Local>,
+        pub service: DetectedService,
+    }
+
+    /// Stub implementation for non-macOS platforms - always returns empty
+    pub fn get_recent_message_handles(_days: u32) -> Result<Vec<RecentHandle>> {
+        Ok(vec![])
+    }
+
+    /// Stub implementation for non-macOS platforms - always returns false
+    pub fn phones_match_public(_phone1: &str, _phone2: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage};
+pub use stub::{get_last_message_for_phones, get_last_message_for_handles, get_messages_for_phones, get_messages_for_handles, run_messages, LastMessage, detect_service_for_phone, DetectedService, get_recent_message_handles, RecentHandle, phones_match_public};

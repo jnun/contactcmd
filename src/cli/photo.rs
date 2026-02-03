@@ -1,11 +1,20 @@
 use anyhow::{anyhow, Result};
+use rfd::FileDialog;
 use std::path::Path;
-use uuid::Uuid;
 
 use crate::cli::photo_utils;
-use crate::cli::ui::select_contact;
+use crate::cli::ui::{find_person_by_identifier, get_display_name};
 use crate::db::Database;
-use crate::models::Person;
+
+/// Opens a native file picker dialog to select an image file.
+/// Returns `None` if the user cancels the dialog.
+fn pick_image_file() -> Option<String> {
+    FileDialog::new()
+        .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"])
+        .set_title("Select photo for contact")
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string())
+}
 
 /// Execute the photo command - set or clear a contact's photo
 pub fn run_photo(db: &Database, identifier: &str, image_path: Option<&str>, clear: bool) -> Result<()> {
@@ -15,13 +24,12 @@ pub fn run_photo(db: &Database, identifier: &str, image_path: Option<&str>, clea
     }
 
     // Find the contact
-    let person = find_person(db, identifier)?;
-    let Some(person) = person else {
+    let Some(person) = find_person_by_identifier(db, identifier)? else {
         println!("No contact found.");
         return Ok(());
     };
 
-    let display_name = person.display_name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+    let display_name = get_display_name(&person);
 
     if clear {
         // Clear existing photo
@@ -30,19 +38,23 @@ pub fn run_photo(db: &Database, identifier: &str, image_path: Option<&str>, clea
         return Ok(());
     }
 
-    let Some(image_path) = image_path else {
-        // Show current photo status
-        if photo_utils::photo_exists(person.id) {
-            let path = photo_utils::photo_path(person.id)?;
-            println!("{}: {}", display_name, path.display());
-        } else {
-            println!("{}: no photo", display_name);
+    // Get image path from argument or file picker
+    let image_path = match image_path {
+        Some(p) => p.to_string(),
+        None => {
+            // Open native file picker
+            match pick_image_file() {
+                Some(p) => p,
+                None => {
+                    println!("No file selected.");
+                    return Ok(());
+                }
+            }
         }
-        return Ok(());
     };
 
     // Validate input path exists
-    let source_path = Path::new(image_path);
+    let source_path = Path::new(&image_path);
     if !source_path.exists() {
         return Err(anyhow!("Image file not found: {}", image_path));
     }
@@ -54,29 +66,10 @@ pub fn run_photo(db: &Database, identifier: &str, image_path: Option<&str>, clea
     Ok(())
 }
 
-fn find_person(db: &Database, identifier: &str) -> Result<Option<Person>> {
-    // Try parsing as UUID first
-    if let Ok(uuid) = Uuid::parse_str(identifier) {
-        return db.get_person_by_id(uuid);
-    }
-
-    // Search by name
-    let words: Vec<&str> = identifier.split_whitespace().collect();
-    let results = db.search_persons_multi(&words, false, 20)?;
-
-    match results.len() {
-        0 => Ok(None),
-        1 => Ok(Some(results.into_iter().next().unwrap())),
-        _ => {
-            // Multiple matches - let user select
-            select_contact(db, &results)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Person;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -95,7 +88,7 @@ mod tests {
     #[test]
     fn test_find_person_by_name() {
         let db = setup_test_db();
-        let person = find_person(&db, "jane").unwrap();
+        let person = find_person_by_identifier(&db, "jane").unwrap();
         assert!(person.is_some());
         assert_eq!(person.unwrap().name_given, Some("Jane".to_string()));
     }

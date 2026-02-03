@@ -8,6 +8,7 @@ mod person;
 mod phone;
 mod special_date;
 mod tag;
+mod task;
 
 pub use address::*;
 pub use contact_detail::*;
@@ -19,3 +20,4 @@ pub use person::*;
 pub use phone::*;
 pub use special_date::*;
 pub use tag::*;
+pub use task::*;

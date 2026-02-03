@@ -1,37 +1,20 @@
 use anyhow::{anyhow, Result};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use inquire::Text;
 use std::io::{self, Write};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::models::{ContactDetail, Person};
-use super::display::print_full_contact;
-use super::list::{handle_edit, handle_edit_all, handle_notes};
+use super::display::print_full_contact_with_tasks;
+use super::list::{handle_full_edit, handle_notes};
 use super::display::format_message_date;
-use super::messages::{get_last_message_for_handles, get_messages_for_handles};
-use super::ui::{clear_screen, minimal_render_config, select_contact, visible_lines};
+use super::email::{compose_and_send_email, show_email_error, EmailSendResult};
+use super::messages::{get_last_message_for_handles, get_messages_for_handles, detect_service_for_phone, DetectedService};
+use super::task::run_tasks_for_contact;
+use super::ui::{clear_screen, confirm, minimal_render_config, select_contact, task_action_label, visible_lines, RawModeGuard, StatusBar};
 #[cfg(target_os = "macos")]
 use super::sync::{delete_from_macos_contacts, get_apple_id};
-
-/// RAII guard that ensures raw mode is disabled on drop
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
-}
 
 /// Execute the show command
 /// Returns Ok(true) if user wants to quit the app
@@ -76,8 +59,8 @@ fn show_by_uuid(db: &Database, uuid: Uuid, identifier: &str) -> Result<bool> {
     }
 }
 
-/// Print a contact with their last message (if available)
-fn print_contact_with_message(detail: &ContactDetail) {
+/// Print a contact with their last message and pending tasks preview
+fn print_contact_with_message_and_tasks(detail: &ContactDetail, pending_tasks: &[crate::models::Task]) {
     // Extract phone numbers and emails for message lookup
     let phones: Vec<String> = detail.phones.iter()
         .map(|p| p.phone_number.clone())
@@ -89,7 +72,7 @@ fn print_contact_with_message(detail: &ContactDetail) {
     // Try to get the last message (gracefully handle errors)
     let last_message = get_last_message_for_handles(&phones, &emails).ok().flatten();
 
-    print_full_contact(detail, last_message.as_ref());
+    print_full_contact_with_tasks(detail, last_message.as_ref(), pending_tasks);
 }
 
 /// Interactive display with edit/delete/notes actions
@@ -99,9 +82,24 @@ fn interactive_display(db: &Database, detail: &ContactDetail) -> Result<bool> {
 
     loop {
         clear_screen()?;
-        print_contact_with_message(detail);
 
-        print!("\n[e]dit [m]essages [d]elete [q]uit: ");
+        // Fetch pending tasks for preview (limit to 3 for efficiency)
+        let pending_tasks = db.get_pending_tasks_for_person(detail.person.id, 3)?;
+        print_contact_with_message_and_tasks(detail, &pending_tasks);
+
+        // Use the count for the status bar label
+        let pending_count = pending_tasks.len() as u32;
+
+        let status = StatusBar::new()
+            .action("e", "dit")
+            .action("n", "ote")
+            .action("m", "sg")
+            .action("t", &task_action_label(pending_count))
+            .action("d", "el")
+            .action("q", "/esc")
+            .action("Q", "uit")
+            .render();
+        print!("\n{}: ", status);
         io::stdout().flush()?;
 
         // Use raw mode for immediate single-key response
@@ -116,16 +114,7 @@ fn interactive_display(db: &Database, detail: &ContactDetail) -> Result<bool> {
         match action {
             KeyCode::Char('e') | KeyCode::Char('E') => {
                 println!();
-                handle_edit(db, detail)?;
-                // Refresh display after edit
-                if let Some(updated) = db.get_contact_detail(detail.person.id)? {
-                    return interactive_display(db, &updated);
-                }
-                break;
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                println!();
-                handle_edit_all(db, detail)?;
+                handle_full_edit(db, detail)?;
                 // Refresh display after edit
                 if let Some(updated) = db.get_contact_detail(detail.person.id)? {
                     return interactive_display(db, &updated);
@@ -150,9 +139,24 @@ fn interactive_display(db: &Database, detail: &ContactDetail) -> Result<bool> {
                 }
                 return interactive_display(db, detail);
             }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                println!();
+                let person_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
+                if run_tasks_for_contact(db, detail.person.id, person_name)? {
+                    clear_screen()?;
+                    quit_app = true;
+                    break; // Quit requested from tasks screen
+                }
+                return interactive_display(db, detail);
+            }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 let display_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
                 println!();
+
+                // Confirm before delete
+                if !confirm(&format!("Delete \"{}\"?", display_name))? {
+                    return interactive_display(db, detail);
+                }
 
                 // Delete from macOS Contacts if synced from there
                 #[cfg(target_os = "macos")]
@@ -168,13 +172,15 @@ fn interactive_display(db: &Database, detail: &ContactDetail) -> Result<bool> {
                 }
                 break;
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                // Back to menu
                 clear_screen()?;
-                quit_app = true;
                 break;
             }
-            KeyCode::Enter => {
+            KeyCode::Char('Q') => {
+                // Quit app entirely
                 clear_screen()?;
+                quit_app = true;
                 break;
             }
             _ => {
@@ -188,7 +194,7 @@ fn interactive_display(db: &Database, detail: &ContactDetail) -> Result<bool> {
 
 /// Show a scrollable messages screen for a contact with selection support
 /// Returns true if user wants to quit the app entirely
-pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bool> {
+pub fn show_messages_screen(db: &Database, detail: &ContactDetail) -> Result<bool> {
     // Collect both phone numbers and email addresses as potential message handles
     let phones: Vec<String> = detail.phones.iter()
         .map(|p| p.phone_number.clone())
@@ -199,17 +205,23 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
 
     let messages = get_messages_for_handles(&phones, &emails, 50)?;
     let display_name = detail.person.display_name.as_deref().unwrap_or("(unnamed)");
-    let can_send = get_send_address(detail).is_some();
+    let can_text = get_send_address(detail).is_some();
+    let has_email = !detail.emails.is_empty();
 
     if messages.is_empty() {
         clear_screen()?;
         println!("No messages for this contact.\n");
 
-        if can_send {
-            print!("[s]end [enter] back: ");
-        } else {
-            print!("[enter] back: ");
+        // Build action bar based on available options
+        let mut status = StatusBar::new();
+        if can_text {
+            status = status.action("t", "ext");
         }
+        if has_email {
+            status = status.action("@", "email");
+        }
+        status = status.action("q", "/esc").action("Q", "uit");
+        print!("{}: ", status.render());
         io::stdout().flush()?;
 
         // Wait for key press
@@ -223,25 +235,46 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
             };
 
             match action {
-                KeyCode::Char('s') | KeyCode::Char('S') if can_send => {
+                KeyCode::Char('t') | KeyCode::Char('T') if can_text => {
                     if let Some(addr) = get_send_address(detail) {
                         match compose_and_send(&addr, display_name)? {
                             SendResult::Sent => {
-                                // Return to refresh messages (will show the new message)
-                                return show_messages_screen(_db, detail);
+                                return show_messages_screen(db, detail);
                             }
                             SendResult::Cancelled => {
-                                return show_messages_screen(_db, detail);
+                                return show_messages_screen(db, detail);
                             }
                             SendResult::Error(msg) => {
                                 show_send_error(&msg)?;
-                                return show_messages_screen(_db, detail);
+                                return show_messages_screen(db, detail);
                             }
                         }
                     }
                 }
+                KeyCode::Char('@') if has_email => {
+                    if let Some(email_addr) = select_email_address(detail)? {
+                        match compose_and_send_email(db, &email_addr, display_name)? {
+                            EmailSendResult::Sent => {
+                                return show_messages_screen(db, detail);
+                            }
+                            EmailSendResult::Cancelled => {
+                                return show_messages_screen(db, detail);
+                            }
+                            EmailSendResult::Error(msg) => {
+                                show_email_error(&msg)?;
+                                return show_messages_screen(db, detail);
+                            }
+                        }
+                    } else {
+                        // Selection cancelled
+                        return show_messages_screen(db, detail);
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(false);
+                    return Ok(false); // Back to contact
+                }
+                KeyCode::Char('Q') => {
+                    return Ok(true); // Quit app entirely
                 }
                 _ => {}
             }
@@ -281,12 +314,19 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
             println!("{} {} {} \"{}\"", marker, direction, date_str, text);
         }
 
-        // Footer with send option if contact has phone/email
-        if can_send {
-            print!("\n{}/{}  [↑/↓] select [enter] view [s]end [q]uit", selected + 1, total_msgs);
-        } else {
-            print!("\n{}/{}  [↑/↓] select [enter] view [q]uit", selected + 1, total_msgs);
+        // Footer with messaging options
+        let mut status = StatusBar::new()
+            .counter(selected + 1, total_msgs)
+            .action("↑/↓", " select")
+            .action("enter", " view");
+        if can_text {
+            status = status.action("t", "ext");
         }
+        if has_email {
+            status = status.action("@", "email");
+        }
+        status = status.action("q", "/esc").action("Q", "uit");
+        print!("\n{}", status.render());
         io::stdout().flush()?;
 
         // Read key
@@ -308,16 +348,36 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
                 selected = selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if show_full_message(&messages[selected], display_name)? {
-                    return Ok(true); // Propagate quit
+                // Enter full message view with navigation
+                let mut view_index = selected;
+                loop {
+                    match show_full_message(&messages, view_index, display_name)? {
+                        FullMessageAction::Back => {
+                            selected = view_index; // Update selection to current viewed message
+                            break;
+                        }
+                        FullMessageAction::Quit => {
+                            return Ok(true); // Propagate quit
+                        }
+                        FullMessageAction::Previous => {
+                            if view_index > 0 {
+                                view_index -= 1;
+                            }
+                        }
+                        FullMessageAction::Next => {
+                            if view_index + 1 < total_msgs {
+                                view_index += 1;
+                            }
+                        }
+                    }
                 }
             }
-            KeyCode::Char('s') | KeyCode::Char('S') if can_send => {
+            KeyCode::Char('t') | KeyCode::Char('T') if can_text => {
                 if let Some(addr) = get_send_address(detail) {
                     match compose_and_send(&addr, display_name)? {
                         SendResult::Sent => {
                             // Return to refresh messages (will show the sent message)
-                            return show_messages_screen(_db, detail);
+                            return show_messages_screen(db, detail);
                         }
                         SendResult::Cancelled => {
                             // Just continue showing messages
@@ -328,17 +388,50 @@ pub fn show_messages_screen(_db: &Database, detail: &ContactDetail) -> Result<bo
                     }
                 }
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            KeyCode::Char('@') if has_email => {
+                if let Some(email_addr) = select_email_address(detail)? {
+                    match compose_and_send_email(db, &email_addr, display_name)? {
+                        EmailSendResult::Sent => {
+                            return show_messages_screen(db, detail);
+                        }
+                        EmailSendResult::Cancelled => {
+                            // Just continue showing messages
+                        }
+                        EmailSendResult::Error(msg) => {
+                            show_email_error(&msg)?;
+                        }
+                    }
+                }
+                // If selection cancelled, just continue showing messages
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
                 return Ok(false); // Return to contact card
+            }
+            KeyCode::Char('Q') => {
+                return Ok(true); // Quit app entirely
             }
             _ => {}
         }
     }
 }
 
-/// Show a single message in full
-/// Returns true if user pressed quit (q), false if they pressed back (enter)
-fn show_full_message(msg: &super::messages::LastMessage, contact_name: &str) -> Result<bool> {
+/// Result of viewing a full message
+enum FullMessageAction {
+    Back,       // Return to message list/contact
+    Quit,       // Quit app entirely
+    Previous,   // Navigate to previous message
+    Next,       // Navigate to next message
+}
+
+/// Show a single message in full with navigation support
+fn show_full_message(
+    messages: &[super::messages::LastMessage],
+    index: usize,
+    contact_name: &str,
+) -> Result<FullMessageAction> {
+    let msg = &messages[index];
+    let total = messages.len();
+
     clear_screen()?;
 
     let direction = if msg.is_from_me { "To" } else { "From" };
@@ -348,20 +441,34 @@ fn show_full_message(msg: &super::messages::LastMessage, contact_name: &str) -> 
     println!("{}\n", date_str);
     println!("{}", msg.text);
 
-    print!("\n[q]uit [enter] back");
+    let status = StatusBar::new()
+        .counter(index + 1, total)
+        .action("↑/↓", " prev/next")
+        .action("enter", " back")
+        .action("q", "/esc")
+        .action("Q", "uit")
+        .render();
+    print!("\n{}", status);
     io::stdout().flush()?;
 
     // Wait for key press
-    let quit = {
+    let action = {
         let _guard = RawModeGuard::new()?;
         loop {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                break matches!(code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc);
+                break match code {
+                    KeyCode::Up | KeyCode::Char('k') => FullMessageAction::Previous,
+                    KeyCode::Down | KeyCode::Char('j') => FullMessageAction::Next,
+                    KeyCode::Char('q') | KeyCode::Esc => FullMessageAction::Back,
+                    KeyCode::Char('Q') => FullMessageAction::Quit,
+                    KeyCode::Enter => FullMessageAction::Back,
+                    _ => continue,
+                };
             }
         }
     };
 
-    Ok(quit)
+    Ok(action)
 }
 
 fn show_person_detail(db: &Database, person: &Person) -> Result<bool> {
@@ -402,6 +509,55 @@ fn get_send_address(detail: &ContactDetail) -> Option<String> {
         return Some(email.email_address.clone());
     }
     None
+}
+
+/// Select which email address to use when a contact has multiple emails.
+/// Returns None if cancelled, Some(email_address) if selected.
+fn select_email_address(detail: &ContactDetail) -> Result<Option<String>> {
+    use super::ui::{minimal_render_config, visible_lines};
+    use inquire::Select;
+
+    let emails = &detail.emails;
+
+    if emails.is_empty() {
+        return Ok(None);
+    }
+
+    // Single email - use it directly
+    if emails.len() == 1 {
+        return Ok(Some(emails[0].email_address.clone()));
+    }
+
+    // Multiple emails - show selection
+    clear_screen()?;
+
+    // Build display options: "type: address" or "type: address (primary)"
+    let options: Vec<String> = emails
+        .iter()
+        .map(|e| {
+            let type_label = e.email_type.as_str();
+            if e.is_primary {
+                format!("{}: {} (primary)", type_label, e.email_address)
+            } else {
+                format!("{}: {}", type_label, e.email_address)
+            }
+        })
+        .collect();
+
+    let result = Select::new("Select email:", options.clone())
+        .with_render_config(minimal_render_config())
+        .with_page_size(visible_lines())
+        .with_vim_mode(true)
+        .prompt_skippable()?;
+
+    match result {
+        Some(selected) => {
+            // Find which email was selected
+            let idx = options.iter().position(|o| *o == selected).unwrap_or(0);
+            Ok(Some(emails[idx].email_address.clone()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Show compose screen and send message
@@ -449,33 +605,68 @@ fn send_imessage(recipient: &str, message: &str) -> Result<()> {
     let is_phone = recipient.chars().any(|c| c.is_ascii_digit())
         && !recipient.contains('@');
 
-    // For phone numbers, try SMS first (works for Android via iPhone relay),
-    // then fall back to iMessage. For emails, use iMessage only.
+    // For phone numbers, check chat history to detect the appropriate service.
+    // This avoids sending iMessage to Android users (which fails silently) or
+    // SMS to iPhone users (green bubbles).
     let script = if is_phone {
-        format!(
-            r#"
-            tell application "Messages"
-                -- Try SMS first (for Android users via iPhone relay)
-                try
-                    set smsService to 1st account whose service type = SMS
-                    set targetBuddy to participant "{0}" of smsService
-                    send "{1}" to targetBuddy
-                    return "sent"
-                end try
+        // Check what service was used in previous conversations
+        let detected = detect_service_for_phone(recipient).unwrap_or(DetectedService::Unknown);
 
-                -- Fall back to iMessage
-                try
-                    set imsgService to 1st account whose service type = iMessage
-                    set targetBuddy to participant "{0}" of imsgService
-                    send "{1}" to targetBuddy
-                    return "sent"
-                end try
+        match detected {
+            DetectedService::Sms => {
+                // Known Android user - use SMS directly
+                format!(
+                    r#"
+                    tell application "Messages"
+                        set smsService to 1st account whose service type = SMS
+                        set targetBuddy to participant "{0}" of smsService
+                        send "{1}" to targetBuddy
+                    end tell
+                    "#,
+                    escaped_recipient, escaped_message
+                )
+            }
+            DetectedService::IMessage => {
+                // Known iPhone user - use iMessage directly
+                format!(
+                    r#"
+                    tell application "Messages"
+                        set imsgService to 1st account whose service type = iMessage
+                        set targetBuddy to participant "{0}" of imsgService
+                        send "{1}" to targetBuddy
+                    end tell
+                    "#,
+                    escaped_recipient, escaped_message
+                )
+            }
+            DetectedService::Unknown => {
+                // No history - try iMessage first, fall back to SMS
+                format!(
+                    r#"
+                    tell application "Messages"
+                        -- Try iMessage first (blue bubbles, preferred)
+                        try
+                            set imsgService to 1st account whose service type = iMessage
+                            set targetBuddy to participant "{0}" of imsgService
+                            send "{1}" to targetBuddy
+                            return "sent"
+                        end try
 
-                error "Could not find SMS or iMessage service"
-            end tell
-            "#,
-            escaped_recipient, escaped_message
-        )
+                        -- Fall back to SMS (green bubbles, for Android users)
+                        try
+                            set smsService to 1st account whose service type = SMS
+                            set targetBuddy to participant "{0}" of smsService
+                            send "{1}" to targetBuddy
+                            return "sent"
+                        end try
+
+                        error "Could not find iMessage or SMS service"
+                    end tell
+                    "#,
+                    escaped_recipient, escaped_message
+                )
+            }
+        }
     } else {
         // Email addresses use iMessage only
         format!(
@@ -509,9 +700,9 @@ fn send_imessage(recipient: &str, message: &str) -> Result<()> {
         if stderr_lower.contains("can't get account") || stderr_lower.contains("no account") {
             if is_phone {
                 anyhow::bail!(
-                    "No SMS or iMessage service available.\n\n\
-                    For SMS: Connect your iPhone and enable Settings > Messages > Text Message Forwarding.\n\
-                    For iMessage: Open Messages.app and sign in with your Apple ID."
+                    "No iMessage or SMS service available.\n\n\
+                    For iMessage: Open Messages.app and sign in with your Apple ID.\n\
+                    For SMS: Connect your iPhone and enable Settings > Messages > Text Message Forwarding."
                 );
             } else {
                 anyhow::bail!(
@@ -536,7 +727,11 @@ fn send_imessage(_recipient: &str, _message: &str) -> Result<()> {
 fn show_send_error(message: &str) -> Result<()> {
     clear_screen()?;
     println!("Error: {}\n", message);
-    print!("[enter] to continue");
+    let status = StatusBar::new()
+        .action("enter", "/")
+        .action("q", " to continue")
+        .render();
+    print!("{}", status);
     io::stdout().flush()?;
 
     let _guard = RawModeGuard::new()?;

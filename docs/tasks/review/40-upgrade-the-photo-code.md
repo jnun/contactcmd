@@ -11,11 +11,11 @@ The photo feature (Task 39) is functional but has code duplication, missing vali
 
 ## Success criteria
 
-- [ ] No duplicated photo utility code across files
-- [ ] Photo command validates image content (not just extension)
-- [ ] Photo sync skips unchanged files
-- [ ] Photo sync has dry-run mode
-- [ ] Test coverage for photo sync and format detection
+- [x] No duplicated photo utility code across files
+- [x] Photo command validates image content (not just extension)
+- [x] Photo sync skips unchanged files
+- [x] Photo sync has dry-run mode
+- [x] Test coverage for photo sync and format detection
 
 ## Issues identified
 

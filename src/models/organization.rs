@@ -57,4 +57,20 @@ impl PersonOrganization {
             is_primary: false,
         }
     }
+
+    /// Create a link marking this person as the organization's representative/contact.
+    pub fn new_representative(person_id: Uuid, organization_id: Uuid) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            person_id,
+            organization_id,
+            title: None,
+            department: None,
+            relationship_type: "representative".to_string(),
+            start_date: None,
+            end_date: None,
+            is_current: true,
+            is_primary: true,
+        }
+    }
 }

@@ -6,59 +6,79 @@ use anyhow::{anyhow, Result};
 use inquire::{Select, Text};
 use std::io::{self, IsTerminal};
 
-use crate::cli::ui::{clear_screen, minimal_render_config};
-use crate::cli::{run_add, run_browse_mode, run_cleanup, run_list, run_messages, run_search, run_show, run_sync};
+use crate::cli::ui::{clear_screen, minimal_render_config, search_input_combined};
+use crate::cli::chat::run_chat;
+use crate::cli::gateway::approve::run_approve;
+use crate::cli::{pick_csv_file, run_add, run_cleanup, run_import, run_messages, run_search, run_setup, run_show, run_sync, run_tasks};
+use crate::cli::list::{run_browse, ViewMode};
 use crate::db::Database;
 
 /// Menu options with type-safe variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuOption {
+    Chat,
+    Tasks,
+    Gateway,
     Browse,
-    List,
+    BrowseByTag,
     Search,
     Show,
     Add,
+    Import,
     MissingEmail,
     MissingPhone,
     Cleanup,
     Sync,
     Messages,
+    Setup,
     Quit,
 }
 
 impl MenuOption {
     const ALL: &'static [MenuOption] = &[
+        MenuOption::Chat,
+        MenuOption::Tasks,
+        MenuOption::Gateway,
         MenuOption::Browse,
-        MenuOption::List,
+        MenuOption::BrowseByTag,
         MenuOption::Search,
         MenuOption::Show,
         MenuOption::Add,
+        MenuOption::Import,
         MenuOption::MissingEmail,
         MenuOption::MissingPhone,
         MenuOption::Cleanup,
         MenuOption::Sync,
         MenuOption::Messages,
+        MenuOption::Setup,
         MenuOption::Quit,
     ];
 
     fn label(self) -> &'static str {
         match self {
+            MenuOption::Chat => "Chat",
+            MenuOption::Tasks => "Tasks",
+            MenuOption::Gateway => "Gateway",
             MenuOption::Browse => "Browse",
-            MenuOption::List => "List",
+            MenuOption::BrowseByTag => "Browse by Tag",
             MenuOption::Search => "Search",
             MenuOption::Show => "Show",
             MenuOption::Add => "Add",
+            MenuOption::Import => "Import",
             MenuOption::MissingEmail => "Missing Email",
             MenuOption::MissingPhone => "Missing Phone",
             MenuOption::Cleanup => "Cleanup",
             MenuOption::Sync => "Sync",
             MenuOption::Messages => "Messages",
+            MenuOption::Setup => "Setup",
             MenuOption::Quit => "Quit",
         }
     }
 
     fn from_label(s: &str) -> Option<MenuOption> {
-        MenuOption::ALL.iter().find(|opt| opt.label() == s).copied()
+        // Handle labels with counts like "Gateway (3)"
+        let base_label = s.split(" (").next().unwrap_or(s);
+        MenuOption::ALL.iter().find(|opt| opt.label() == base_label).copied()
     }
 }
 
@@ -75,16 +95,27 @@ pub fn run_menu(db: &Database) -> Result<()> {
         ));
     }
 
-    let menu_labels: Vec<&str> = MenuOption::ALL.iter().map(|opt| opt.label()).collect();
-
     loop {
         // Clear screen - if this fails, continue anyway (degraded but functional)
         let _ = clear_screen();
 
-        let selection = Select::new("contactcmd", menu_labels.clone())
+        // Build menu labels with dynamic counts
+        let gateway_pending = db.count_pending_queue().unwrap_or(0);
+        let menu_labels: Vec<String> = MenuOption::ALL.iter().map(|opt| {
+            if *opt == MenuOption::Gateway && gateway_pending > 0 {
+                format!("{} ({})", opt.label(), gateway_pending)
+            } else {
+                opt.label().to_string()
+            }
+        }).collect();
+        let menu_refs: Vec<&str> = menu_labels.iter().map(|s| s.as_str()).collect();
+        let menu_len = menu_refs.len();
+
+        let selection = Select::new("contactcmd", menu_refs)
             .with_render_config(minimal_render_config())
-            .with_page_size(menu_labels.len())
+            .with_page_size(menu_len)
             .with_vim_mode(true)
+            .without_filtering()
             .prompt_skippable();
 
         // Handle prompt errors (Ctrl+C, terminal issues) - exit gracefully
@@ -128,21 +159,121 @@ pub fn run_menu(db: &Database) -> Result<()> {
 /// Returns Ok(true) if the user wants to quit the app
 fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
     match choice {
+        MenuOption::Chat => {
+            run_chat(db)
+        }
+        MenuOption::Tasks => {
+            run_tasks(db)
+        }
+        MenuOption::Gateway => {
+            let pending = db.count_pending_queue()?;
+            if pending == 0 {
+                println!("No pending messages in gateway queue.");
+                wait_for_continue();
+                Ok(false)
+            } else {
+                run_approve(db)
+            }
+        }
         MenuOption::Browse => {
             let persons = db.list_persons(10000, 0)?;
-            run_browse_mode(db, persons).map(|_| false)
+            run_browse(db, persons, ViewMode::Card).map(|_| false)
         }
-        MenuOption::List => {
-            run_list(db, 1, 0, None, "asc".into(), false, false).map(|_| false)
+        MenuOption::BrowseByTag => {
+            let tags = db.list_tags()?;
+            if tags.is_empty() {
+                println!("No tags defined yet.");
+                wait_for_continue();
+                return Ok(false);
+            }
+
+            let options: Vec<String> = tags.iter().map(|t| {
+                let count = db.get_persons_by_tag(&t.name).map(|p| p.len()).unwrap_or(0);
+                format!("{} ({} contacts)", t.name, count)
+            }).collect();
+
+            let selection = Select::new("Select a tag:", options)
+                .with_render_config(minimal_render_config())
+                .without_filtering()
+                .prompt_skippable()?;
+
+            let Some(selected) = selection else {
+                return Ok(false);
+            };
+
+            // Extract tag name (before the " (")
+            let tag_name = selected.split(" (").next().unwrap_or(&selected);
+            let persons = db.get_persons_by_tag(tag_name)?;
+
+            if persons.is_empty() {
+                println!("No contacts with tag '{}'", tag_name);
+                wait_for_continue();
+                return Ok(false);
+            }
+
+            run_browse(db, persons, ViewMode::Card).map(|_| false)
         }
         MenuOption::Search => {
-            let query = prompt_for_input("search: ")?;
+            // Combined search input: text field + filter selector on same screen
+            let result = search_input_combined("search: ")?;
+
+            let Some(input) = result else {
+                return Ok(false);
+            };
+
+            let query = input.query.trim();
             if query.is_empty() {
-                // Empty search shows all contacts (becomes list)
-                run_list(db, 1, 20, None, "asc".into(), false, true).map(|_| false)
-            } else {
-                run_search(db, &query, false, None).map(|_| false)
+                let persons = db.list_persons(10000, 0)?;
+                return run_browse(db, persons, ViewMode::Table).map(|_| false);
             }
+
+            // Handle Tag filter specially - prompt for tag selection
+            if input.field.is_tag() {
+                let tags = db.list_tags()?;
+                if tags.is_empty() {
+                    println!("No tags defined yet.");
+                    wait_for_continue();
+                    return Ok(false);
+                }
+
+                let options: Vec<String> = tags.iter().map(|t| {
+                    let count = db.get_persons_by_tag(&t.name).map(|p| p.len()).unwrap_or(0);
+                    format!("{} ({} contacts)", t.name, count)
+                }).collect();
+
+                let selection = Select::new("Select tag:", options)
+                    .with_render_config(minimal_render_config())
+                    .without_filtering()
+                    .prompt_skippable()?;
+
+                let Some(selected) = selection else {
+                    return Ok(false);
+                };
+
+                let tag_name = selected.split(" (").next().unwrap_or(&selected);
+
+                // Search within tagged contacts
+                let persons = db.get_persons_by_tag(tag_name)?;
+                let query_lower = query.to_lowercase();
+                let filtered: Vec<_> = persons
+                    .into_iter()
+                    .filter(|p| {
+                        p.search_name.as_ref().map(|n| n.contains(&query_lower)).unwrap_or(false)
+                            || p.display_name.as_ref().map(|n| n.to_lowercase().contains(&query_lower)).unwrap_or(false)
+                    })
+                    .collect();
+
+                if filtered.is_empty() {
+                    println!("No matches for '{}' in tag '{}'", query, tag_name);
+                    wait_for_continue();
+                    return Ok(false);
+                }
+
+                return run_browse(db, filtered, ViewMode::Card).map(|_| false);
+            }
+
+            // Regular field search
+            run_search(db, query, false, None, input.field.to_field_str()).map(|_| false)
         }
         MenuOption::Show => {
             let name = prompt_for_input("name: ")?;
@@ -154,11 +285,48 @@ fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
         MenuOption::Add => {
             run_add(db, None, None, None, None, None).map(|_| false)
         }
+        MenuOption::Import => {
+            let options = vec!["Browse for file", "Enter path manually"];
+            let choice = Select::new("How would you like to select the CSV file?", options)
+                .with_render_config(minimal_render_config())
+                .without_filtering()
+                .prompt_skippable()?;
+
+            let file = match choice.as_deref() {
+                Some("Browse for file") => {
+                    match pick_csv_file() {
+                        Some(path) => path,
+                        None => {
+                            println!("No file selected.");
+                            return Ok(false);
+                        }
+                    }
+                }
+                Some("Enter path manually") => {
+                    let path = prompt_for_input("CSV file path: ")?;
+                    if path.is_empty() {
+                        return Ok(false);
+                    }
+                    path
+                }
+                _ => return Ok(false),
+            };
+
+            let dry_run = inquire::Confirm::new("Dry run?")
+                .with_default(true)
+                .with_render_config(minimal_render_config())
+                .prompt_skippable()?
+                .unwrap_or(true);
+
+            run_import(db, &file, dry_run, None)?;
+            wait_for_continue();
+            Ok(false)
+        }
         MenuOption::MissingEmail => {
-            run_search(db, "", false, Some("email")).map(|_| false)
+            run_search(db, "", false, Some("email"), None).map(|_| false)
         }
         MenuOption::MissingPhone => {
-            run_search(db, "", false, Some("phone")).map(|_| false)
+            run_search(db, "", false, Some("phone"), None).map(|_| false)
         }
         MenuOption::Cleanup => {
             run_cleanup(db).map(|_| false)
@@ -178,6 +346,9 @@ fn execute_command(db: &Database, choice: MenuOption) -> Result<bool> {
                 return Ok(false);
             }
             run_messages(db, &query, None).map(|_| false)
+        }
+        MenuOption::Setup => {
+            run_setup(db).map(|_| false)
         }
         MenuOption::Quit => Ok(true),
     }
@@ -232,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_menu_option_all_has_correct_count() {
-        assert_eq!(MenuOption::ALL.len(), 11);
+        assert_eq!(MenuOption::ALL.len(), 16);
     }
 
     #[test]

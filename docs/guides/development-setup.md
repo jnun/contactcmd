@@ -38,6 +38,30 @@ cargo test db::persons:: # Run specific module
 cargo fmt && cargo clippy && cargo test
 ```
 
+## AI Chat Setup
+
+The chat interface requires an OpenAI-compatible API endpoint.
+
+```bash
+# Configure via setup command
+contactcmd setup
+
+# Or set directly in database settings:
+# - ai.provider = "remote"
+# - ai.api_key = "sk-..."
+# - ai.api_url = "https://api.openai.com/v1" (or compatible)
+# - ai.model = "gpt-4" (or similar)
+```
+
+**Editing AI instructions:**
+
+The AI prompt lives in `src/cli/ai/instructions.md` and is compiled into the binary via `include_str!`. Changes require recompilation.
+
+Tips for editing:
+- Keep it short - long prompts confuse the AI
+- Use positive language ("use X for Y") not negative ("don't do X")
+- Simple examples work better than complex rules
+
 ## Debugging
 
 ```bash

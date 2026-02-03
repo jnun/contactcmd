@@ -10,26 +10,52 @@ authors = ["jnun"]
 keywords = ["cli", "contacts", "crm", "macos"]
 categories = ["command-line-utilities"]
 
+[features]
+default = []
+local-ai = ["llama-cpp-2"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+async-trait = "0.1"
+sysinfo = "0.30"
+llama-cpp-2 = { version = "0.1", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
-inquire = "0.7"
+inquire = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+csv = "1.3"
 anyhow = "1"
 thiserror = "2"
 dirs = "6"
+oauth2 = "4"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+webbrowser = "1"
+base64 = "0.22"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 viuer = { version = "0.11", features = ["print-file"] }
 image = "0.25"
+rfd = "0.15"
+hmac = "0.12"
+sha2 = "0.10"
+regex = "1"
+hex = "0.4"
+rand = "0.8"
+hostname = "0.4"
+ctrlc = "3.4"
+libc = "0.2"
+daemonize = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-contacts = { version = "0.3", features = ["block2", "CNContact", "CNContactStore", "CNContactFetchRequest", "CNLabeledValue", "CNPhoneNumber", "CNPostalAddress"] }
 objc2-foundation = { version = "0.3", features = ["NSObject", "NSString", "NSArray", "NSError", "NSCalendar", "NSPredicate", "NSObjCRuntime", "NSKeyValueCoding"] }
 block2 = "0.6"
+imessage-database = "3.3"
 
 [dev-dependencies]
 tempfile = "3"

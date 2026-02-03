@@ -106,6 +106,43 @@ For interactive displays where immediate response matters.
 [e]dit [m]essages [d]elete [q]uit: _
 ```
 
+### Browse-Style Navigation
+The standard pattern for action screens after the main menu:
+
+```
+1/2378  [e]dit [m]essages [d]elete [←/→] [q]uit:
+```
+
+Components:
+- Position indicator: `1/2378` (current/total)
+- Actions with hotkeys: `[e]dit`, `[m]essages`, `[@]email`
+- Navigation hints: `[←/→]` for horizontal, `[↑/↓]` for vertical
+- Exit: `[q]uit:`
+
+### Settings Actions
+For configuration screens, use `[k]eep` and `[d]iscard` to avoid conflicts with `[s]`:
+
+```
+[e]dit [c]lear [q]uit:
+```
+
+When editing settings:
+```
+Type signature, then 'k' to [k]eep or 'd' to [d]iscard:
+```
+
+### Email Actions
+For email compose, use `[s]end` since there's no conflict:
+
+```
+[s]end [q]uit:
+```
+
+During message composition:
+```
+Type message, then 's' to [s]end or 'c' to [c]ancel:
+```
+
 ### Confirmation
 Use inquire Confirm. Default to "no" for destructive actions.
 
@@ -550,6 +587,92 @@ Delete John Smith? (y/N): _
 ```
 Syncing from macOS Contacts...
 142 contacts synced.
+```
+
+### Setup Screen
+
+```
+Setup
+
+External Services:
+  [e] Email - configured (jason@example.com)
+
+[e]mail [q]uit:
+```
+
+### Email Signature Setup
+
+```
+Email Signature
+
+Current signature:
+┌─────────────────────────────┐
+│ - Jason Nunnelley
+│ CEO, Acme Corp
+└─────────────────────────────┘
+
+[e]dit [c]lear [q]uit:
+```
+
+### Email Compose
+
+```
+Compose Email
+
+To: John Smith (john@example.com)
+From: me@gmail.com
+
+Subject: Catching up
+
+┌─ signature ─────────────────┐
+│ --
+│ - Jason Nunnelley
+└─────────────────────────────┘
+
+Type message, then 's' to [s]end or 'c' to [c]ancel:
+
+Hey John,
+
+Great meeting you at the conference!
+s
+```
+
+### Email Confirmation
+
+```
+Ready to send:
+
+To: John Smith (john@example.com)
+From: me@gmail.com
+Subject: Catching up
+
+  Hey John,
+
+  Great meeting you at the conference!
+  ...
+
+[s]end [q]uit:
+```
+
+### Messages Screen with Email Option
+
+When contact has email, show [@] option:
+
+```
+No messages for this contact.
+
+[t]ext [@]email [q]uit:
+```
+
+With messages:
+
+```
+Messages: John Smith
+
+> Today at 10:15am "Sure, let's meet Thursday"
+< Today at 9:30am "Are you free this week?"
+
+1/5  [↑/↓] select [enter] view [t]ext [@]email [q]uit:
 ```
 
 ### Error States

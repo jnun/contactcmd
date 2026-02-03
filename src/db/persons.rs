@@ -1,11 +1,11 @@
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Row};
+use rusqlite::{params, OptionalExtension, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::Database;
-use crate::models::*;
+use crate::models::{*, PrivacyLevel, Task};
 
 /// Display info for a person: (primary_email, location)
 pub type DisplayInfo = HashMap<Uuid, (Option<String>, Option<String>)>;
@@ -26,8 +26,8 @@ impl Database {
                 id, name_given, name_family, name_middle, name_prefix, name_suffix,
                 name_nickname, preferred_name, display_name, sort_name, search_name,
                 name_order, person_type, notes, is_active, created_at, updated_at,
-                is_dirty, external_ids
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                is_dirty, external_ids, checkin_date, ai_contact_allowed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             params![
                 person.id.to_string(),
                 person.name_given,
@@ -48,6 +48,8 @@ impl Database {
                 person.updated_at.to_rfc3339(),
                 person.is_dirty as i32,
                 person.external_ids,
+                person.checkin_date.map(|d| d.to_rfc3339()),
+                person.ai_contact_allowed as i32,
             ],
         )?;
         Ok(())
@@ -85,6 +87,39 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Find a person by their phone number. Returns the first active match.
+    /// Normalizes the phone number by removing formatting characters before comparison.
+    pub fn get_person_by_phone(&self, phone: &str) -> Result<Option<Person>> {
+        // Normalize the input phone number (keep only digits and +)
+        let normalized: String = phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+
+        // Guard against empty/invalid phone numbers
+        if normalized.is_empty() || normalized.chars().filter(|c| c.is_ascii_digit()).count() < 7 {
+            return Ok(None);
+        }
+
+        // Query all phones and compare normalized versions
+        // Note: We do application-side normalization because phone formats vary widely
+        // and SQLite doesn't have built-in phone normalization functions
+        let mut stmt = self.conn.prepare(
+            r#"SELECT p.*, ph.phone_number FROM persons p
+               INNER JOIN phones ph ON ph.person_id = p.id
+               WHERE p.is_active = 1"#,
+        )?;
+
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let stored_phone: String = row.get("phone_number")?;
+            let stored_normalized: String = stored_phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+
+            if stored_normalized == normalized {
+                return Ok(Some(Self::row_to_person(row)?));
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn list_persons(&self, limit: u32, offset: u32) -> Result<Vec<Person>> {
@@ -323,14 +358,14 @@ impl Database {
             if case_sensitive {
                 // GLOB is case-sensitive in SQLite
                 conditions.push(format!(
-                    "(p.display_name GLOB ?{0} OR e.email_address GLOB ?{0} OR n.content GLOB ?{0} OR a.city GLOB ?{0} OR o.name GLOB ?{0})",
+                    "(p.display_name GLOB ?{0} OR e.email_address GLOB ?{0} OR p.notes GLOB ?{0} OR a.city GLOB ?{0} OR a.state GLOB ?{0} OR o.name GLOB ?{0})",
                     param_num
                 ));
             } else {
                 // search_name is already lowercase; LIKE is case-insensitive
                 // ESCAPE '\' enables backslash escaping for % and _ literals
                 conditions.push(format!(
-                    "(p.search_name LIKE ?{0} ESCAPE '\\' OR LOWER(e.email_address) LIKE ?{0} ESCAPE '\\' OR LOWER(n.content) LIKE ?{0} ESCAPE '\\' OR LOWER(a.city) LIKE ?{0} ESCAPE '\\' OR LOWER(o.name) LIKE ?{0} ESCAPE '\\')",
+                    "(p.search_name LIKE ?{0} ESCAPE '\\' OR LOWER(e.email_address) LIKE ?{0} ESCAPE '\\' OR LOWER(p.notes) LIKE ?{0} ESCAPE '\\' OR LOWER(a.city) LIKE ?{0} ESCAPE '\\' OR LOWER(a.state) LIKE ?{0} ESCAPE '\\' OR LOWER(o.name) LIKE ?{0} ESCAPE '\\')",
                     param_num
                 ));
             }
@@ -342,7 +377,6 @@ impl Database {
         let sql = format!(
             r#"SELECT DISTINCT p.* FROM persons p
                LEFT JOIN emails e ON e.person_id = p.id
-               LEFT JOIN notes n ON n.person_id = p.id
                LEFT JOIN addresses a ON a.person_id = p.id
                LEFT JOIN person_organizations po ON po.person_id = p.id
                LEFT JOIN organizations o ON o.id = po.organization_id
@@ -355,6 +389,218 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
 
         // Build parameter slice
+        let mut all_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for p in &params {
+            all_params.push(p);
+        }
+        all_params.push(&limit);
+
+        let persons = stmt
+            .query_map(rusqlite::params_from_iter(all_params), Self::row_to_person)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(persons)
+    }
+
+    /// Search persons by a specific field: "name", "city", "state", or "note"
+    pub fn search_persons_by_field(
+        &self,
+        words: &[&str],
+        field: &str,
+        case_sensitive: bool,
+        limit: u32,
+    ) -> Result<Vec<Person>> {
+        if words.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let field_lower = field.to_lowercase();
+
+        // Determine SQL join and column based on field
+        // For "address" we need special handling to search both city and state
+        let is_address_search = field_lower == "address";
+
+        let (join_clause, col_insensitive, col_sensitive) = match field_lower.as_str() {
+            "name" => ("", "p.search_name", "p.display_name"),
+            "city" => ("LEFT JOIN addresses a ON a.person_id = p.id", "LOWER(a.city)", "a.city"),
+            "state" => ("LEFT JOIN addresses a ON a.person_id = p.id", "LOWER(a.state)", "a.state"),
+            "address" => ("LEFT JOIN addresses a ON a.person_id = p.id", "", ""), // handled specially
+            "note" | "notes" => ("", "LOWER(p.notes)", "p.notes"),
+            _ => {
+                anyhow::bail!("Invalid --field value: \"{}\". Use \"name\", \"city\", \"state\", \"address\", or \"note\".", field);
+            }
+        };
+
+        let mut conditions = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+
+        for (i, word) in words.iter().enumerate() {
+            let pattern = if case_sensitive {
+                format!("*{}*", Self::escape_glob(word))
+            } else {
+                format!("%{}%", Self::escape_like(&word.to_lowercase()))
+            };
+            params.push(pattern);
+
+            let param_num = i + 1;
+            let condition = if is_address_search {
+                // Search both city and state
+                if case_sensitive {
+                    format!("(a.city GLOB ?{0} OR a.state GLOB ?{0})", param_num)
+                } else {
+                    format!("(LOWER(a.city) LIKE ?{0} ESCAPE '\\' OR LOWER(a.state) LIKE ?{0} ESCAPE '\\')", param_num)
+                }
+            } else if case_sensitive {
+                format!("({} GLOB ?{})", col_sensitive, param_num)
+            } else {
+                format!("({} LIKE ?{} ESCAPE '\\')", col_insensitive, param_num)
+            };
+
+            conditions.push(condition);
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let limit_param = params.len() + 1;
+
+        let sql = format!(
+            r#"SELECT DISTINCT p.* FROM persons p
+               {}
+               WHERE p.is_active = 1 AND ({})
+               ORDER BY p.sort_name ASC
+               LIMIT ?{}"#,
+            join_clause, where_clause, limit_param
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let mut all_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for p in &params {
+            all_params.push(p);
+        }
+        all_params.push(&limit);
+
+        let persons = stmt
+            .query_map(rusqlite::params_from_iter(all_params), Self::row_to_person)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(persons)
+    }
+
+    /// Natural language search: "jason in alabama at google"
+    /// Searches name terms against name fields, location terms against city/state,
+    /// and org terms against organization names. All conditions are ANDed.
+    pub fn search_persons_natural(
+        &self,
+        name_words: &[&str],
+        location_words: &[&str],
+        org_words: &[&str],
+        case_sensitive: bool,
+        limit: u32,
+    ) -> Result<Vec<Person>> {
+        // If all empty, return nothing
+        if name_words.is_empty() && location_words.is_empty() && org_words.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut conditions = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+        let mut param_num = 0;
+
+        // Determine if we need joins
+        let need_address_join = !location_words.is_empty();
+        let need_org_join = !org_words.is_empty();
+
+        // Build name conditions (search name, display_name, email, notes)
+        for word in name_words {
+            param_num += 1;
+            let pattern = if case_sensitive {
+                format!("*{}*", Self::escape_glob(word))
+            } else {
+                format!("%{}%", Self::escape_like(&word.to_lowercase()))
+            };
+            params.push(pattern);
+
+            if case_sensitive {
+                conditions.push(format!(
+                    "(p.display_name GLOB ?{0} OR e.email_address GLOB ?{0} OR p.notes GLOB ?{0})",
+                    param_num
+                ));
+            } else {
+                conditions.push(format!(
+                    "(p.search_name LIKE ?{0} ESCAPE '\\' OR LOWER(e.email_address) LIKE ?{0} ESCAPE '\\' OR LOWER(p.notes) LIKE ?{0} ESCAPE '\\')",
+                    param_num
+                ));
+            }
+        }
+
+        // Build location conditions (city, state)
+        for word in location_words {
+            param_num += 1;
+            let pattern = if case_sensitive {
+                format!("*{}*", Self::escape_glob(word))
+            } else {
+                format!("%{}%", Self::escape_like(&word.to_lowercase()))
+            };
+            params.push(pattern);
+
+            if case_sensitive {
+                conditions.push(format!(
+                    "(a.city GLOB ?{0} OR a.state GLOB ?{0})",
+                    param_num
+                ));
+            } else {
+                conditions.push(format!(
+                    "(LOWER(a.city) LIKE ?{0} ESCAPE '\\' OR LOWER(a.state) LIKE ?{0} ESCAPE '\\')",
+                    param_num
+                ));
+            }
+        }
+
+        // Build organization conditions
+        for word in org_words {
+            param_num += 1;
+            let pattern = if case_sensitive {
+                format!("*{}*", Self::escape_glob(word))
+            } else {
+                format!("%{}%", Self::escape_like(&word.to_lowercase()))
+            };
+            params.push(pattern);
+
+            if case_sensitive {
+                conditions.push(format!("(o.name GLOB ?{})", param_num));
+            } else {
+                conditions.push(format!("(LOWER(o.name) LIKE ?{} ESCAPE '\\')", param_num));
+            }
+        }
+
+        // Build JOIN clause
+        let mut joins = String::from("LEFT JOIN emails e ON e.person_id = p.id");
+        if need_address_join {
+            joins.push_str("\n               LEFT JOIN addresses a ON a.person_id = p.id");
+        }
+        if need_org_join {
+            joins.push_str("\n               LEFT JOIN person_organizations po ON po.person_id = p.id");
+            joins.push_str("\n               LEFT JOIN organizations o ON o.id = po.organization_id");
+        }
+
+        let where_clause = if conditions.is_empty() {
+            "1=1".to_string()
+        } else {
+            conditions.join(" AND ")
+        };
+        let limit_param = params.len() + 1;
+
+        let sql = format!(
+            r#"SELECT DISTINCT p.* FROM persons p
+               {}
+               WHERE p.is_active = 1 AND ({})
+               ORDER BY p.sort_name ASC
+               LIMIT ?{}"#,
+            joins, where_clause, limit_param
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
         let mut all_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
         for p in &params {
             all_params.push(p);
@@ -533,6 +779,150 @@ impl Database {
         Ok(tags)
     }
 
+    /// Insert a new tag
+    pub fn insert_tag(&self, tag: &Tag) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tags (id, name, color) VALUES (?, ?, ?)",
+            (tag.id.to_string(), &tag.name, &tag.color),
+        )?;
+        Ok(())
+    }
+
+    /// Get a tag by name, or create it if it doesn't exist
+    pub fn get_or_create_tag(&self, name: &str) -> Result<Tag> {
+        let existing: Option<Tag> = self
+            .conn
+            .query_row(
+                "SELECT id, name, color FROM tags WHERE name = ?",
+                [name],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok(Tag {
+                        id: parse_uuid(&id)?,
+                        name: row.get(1)?,
+                        color: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        match existing {
+            Some(tag) => Ok(tag),
+            None => {
+                let tag = Tag::new(name.to_string());
+                self.insert_tag(&tag)?;
+                Ok(tag)
+            }
+        }
+    }
+
+    /// Add a tag to a person (idempotent - ignores duplicates)
+    pub fn add_tag_to_person(&self, person_id: Uuid, tag_id: Uuid) -> Result<()> {
+        let pt = PersonTag::new(person_id, tag_id);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO person_tags (id, person_id, tag_id, added_at) VALUES (?, ?, ?, ?)",
+            (
+                pt.id.to_string(),
+                pt.person_id.to_string(),
+                pt.tag_id.to_string(),
+                pt.added_at.to_rfc3339(),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Get all persons with a specific tag
+    pub fn get_persons_by_tag(&self, tag_name: &str) -> Result<Vec<Person>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT p.* FROM persons p
+               JOIN person_tags pt ON pt.person_id = p.id
+               JOIN tags t ON t.id = pt.tag_id
+               WHERE t.name = ?
+               ORDER BY p.sort_name"#,
+        )?;
+
+        let persons = stmt
+            .query_map([tag_name], |row| Database::row_to_person(row))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(persons)
+    }
+
+    /// Tag all persons of a specific type with a tag
+    pub fn tag_persons_by_type(&self, person_type: PersonType, tag_name: &str) -> Result<u32> {
+        let tag = self.get_or_create_tag(tag_name)?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM persons WHERE person_type = ?",
+        )?;
+
+        let person_ids: Vec<Uuid> = stmt
+            .query_map([person_type.as_str()], |row| {
+                let id: String = row.get(0)?;
+                parse_uuid(&id)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let count = person_ids.len() as u32;
+        for person_id in person_ids {
+            self.add_tag_to_person(person_id, tag.id)?;
+        }
+
+        Ok(count)
+    }
+
+    /// List all tags
+    pub fn list_tags(&self) -> Result<Vec<Tag>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, color FROM tags ORDER BY name",
+        )?;
+
+        let tags = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                Ok(Tag {
+                    id: parse_uuid(&id)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tags)
+    }
+
+    /// Delete a tag and all its associations
+    pub fn delete_tag(&self, tag_name: &str) -> Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM tags WHERE name = ?",
+            [tag_name],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Remove a tag from a person
+    pub fn remove_tag_from_person(&self, person_id: Uuid, tag_name: &str) -> Result<bool> {
+        let deleted = self.conn.execute(
+            r#"DELETE FROM person_tags
+               WHERE person_id = ?
+               AND tag_id IN (SELECT id FROM tags WHERE name = ?)"#,
+            (person_id.to_string(), tag_name),
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete all persons with a specific tag
+    pub fn delete_persons_by_tag(&self, tag_name: &str) -> Result<u32> {
+        let persons = self.get_persons_by_tag(tag_name)?;
+        let count = persons.len() as u32;
+
+        for person in persons {
+            self.delete_person(person.id)?;
+        }
+
+        Ok(count)
+    }
+
     // ==================== PERSON UPDATE ====================
 
     /// Update a person. Automatically sets `updated_at` to now.
@@ -543,7 +933,8 @@ impl Database {
                 name_given = ?, name_family = ?, name_middle = ?, name_prefix = ?,
                 name_suffix = ?, name_nickname = ?, preferred_name = ?, display_name = ?,
                 sort_name = ?, search_name = ?, name_order = ?, person_type = ?,
-                notes = ?, is_active = ?, updated_at = ?, is_dirty = ?, external_ids = ?
+                notes = ?, is_active = ?, updated_at = ?, is_dirty = ?, external_ids = ?,
+                checkin_date = ?, ai_contact_allowed = ?
                WHERE id = ?"#,
             params![
                 person.name_given,
@@ -563,10 +954,73 @@ impl Database {
                 now.to_rfc3339(),
                 person.is_dirty as i32,
                 person.external_ids,
+                person.checkin_date.map(|d| d.to_rfc3339()),
+                person.ai_contact_allowed as i32,
                 person.id.to_string(),
             ],
         )?;
         Ok(())
+    }
+
+    // ==================== CHECKIN OPERATIONS ====================
+
+    /// Set the checkin date for a person
+    pub fn set_checkin_date(&self, person_id: Uuid, date: chrono::DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE persons SET checkin_date = ?, updated_at = ? WHERE id = ?",
+            params![date.to_rfc3339(), Utc::now().to_rfc3339(), person_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the checkin date for a person (mark as done)
+    pub fn clear_checkin_date(&self, person_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE persons SET checkin_date = NULL, updated_at = ? WHERE id = ?",
+            params![Utc::now().to_rfc3339(), person_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Get all persons with checkin dates due today or earlier (overdue)
+    pub fn get_checkins_due(&self) -> Result<Vec<Person>> {
+        // Use start of tomorrow (midnight) as the cutoff - simpler and DST-safe
+        // Checkins are stored at 9am, so comparing < tomorrow_start catches all of today
+        let tomorrow_start = (chrono::Local::now().date_naive() + chrono::Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .latest()  // Handle DST ambiguity by picking later time
+            .unwrap_or_else(|| chrono::Local::now()) // Fallback if time doesn't exist
+            .with_timezone(&Utc);
+
+        // Note: RFC3339 dates are lexicographically sortable, so string comparison works
+        let mut stmt = self.conn.prepare(
+            r#"SELECT * FROM persons
+               WHERE is_active = 1 AND checkin_date IS NOT NULL AND checkin_date < ?
+               ORDER BY checkin_date ASC"#,
+        )?;
+
+        let persons = stmt
+            .query_map([tomorrow_start.to_rfc3339()], Self::row_to_person)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(persons)
+    }
+
+    /// Get all persons with any checkin date set (upcoming)
+    pub fn get_all_checkins(&self) -> Result<Vec<Person>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT * FROM persons
+               WHERE is_active = 1 AND checkin_date IS NOT NULL
+               ORDER BY checkin_date ASC"#,
+        )?;
+
+        let persons = stmt
+            .query_map([], Self::row_to_person)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(persons)
     }
 
     // ==================== PERSON DELETE ====================
@@ -577,6 +1031,35 @@ impl Database {
             .conn
             .execute("DELETE FROM persons WHERE id = ?", [id.to_string()])?;
         Ok(rows > 0)
+    }
+
+    /// Restore a previously deleted contact with all related data.
+    /// Used for soft undo after delete.
+    pub fn restore_person(&self, detail: &crate::models::ContactDetail) -> Result<bool> {
+        self.insert_person(&detail.person)?;
+
+        for email in &detail.emails {
+            self.insert_email(email)?;
+        }
+        for phone in &detail.phones {
+            self.insert_phone(phone)?;
+        }
+        for addr in &detail.addresses {
+            self.insert_address(addr)?;
+        }
+        for (po, org) in &detail.organizations {
+            // Ensure org exists (may have been kept if other contacts reference it)
+            let _ = self.get_or_create_organization(&org.name)?;
+            self.insert_person_organization(po)?;
+        }
+        for note in &detail.notes {
+            self.insert_note(note)?;
+        }
+        for date in &detail.special_dates {
+            self.insert_special_date(date)?;
+        }
+
+        Ok(true)
     }
 
     /// Batch delete multiple persons in a single transaction.
@@ -849,6 +1332,7 @@ impl Database {
         let person_type: String = row.get("person_type")?;
         let created_at: String = row.get("created_at")?;
         let updated_at: String = row.get("updated_at")?;
+        let checkin_date: Option<String> = row.get("checkin_date")?;
 
         Ok(Person {
             id: parse_uuid(&id)?,
@@ -874,6 +1358,12 @@ impl Database {
                 .unwrap_or_else(|_| Utc::now()),
             is_dirty: row.get::<_, i32>("is_dirty")? == 1,
             external_ids: row.get("external_ids")?,
+            checkin_date: checkin_date.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            }),
+            ai_contact_allowed: row.get::<_, i32>("ai_contact_allowed")? == 1,
         })
     }
 
@@ -921,6 +1411,20 @@ impl Database {
             country: row.get("country")?,
             address_type: AddressType::parse(&address_type_str.unwrap_or_default()),
             is_primary: row.get::<_, i32>("is_primary")? == 1,
+        })
+    }
+
+    fn row_to_organization(row: &Row) -> rusqlite::Result<Organization> {
+        let id: String = row.get("id")?;
+        Ok(Organization {
+            id: parse_uuid(&id)?,
+            name: row.get("name")?,
+            org_type: row.get("org_type")?,
+            industry: row.get("industry")?,
+            website: row.get("website")?,
+            city: row.get("city")?,
+            state: row.get("state")?,
+            country: row.get("country")?,
         })
     }
 
@@ -1069,23 +1573,11 @@ impl Database {
     }
 
     pub fn get_organization_by_name(&self, name: &str) -> Result<Option<Organization>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, org_type, industry, website, city, state, country FROM organizations WHERE name = ?",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM organizations WHERE name = ?")?;
 
-        let result = stmt.query_row([name], |row| {
-            let id: String = row.get(0)?;
-            Ok(Organization {
-                id: parse_uuid(&id)?,
-                name: row.get(1)?,
-                org_type: row.get(2)?,
-                industry: row.get(3)?,
-                website: row.get(4)?,
-                city: row.get(5)?,
-                state: row.get(6)?,
-                country: row.get(7)?,
-            })
-        });
+        let result = stmt.query_row([name], Self::row_to_organization);
 
         match result {
             Ok(org) => Ok(Some(org)),
@@ -1103,6 +1595,45 @@ impl Database {
         let org = Organization::new(name.to_string());
         self.insert_organization(&org)?;
         Ok(org)
+    }
+
+    /// Search organizations by name (case-insensitive).
+    /// Optionally filter by city and/or state for stricter matching.
+    /// Returns matching organizations or empty vec if none found.
+    pub fn search_organizations_by_name(
+        &self,
+        name: &str,
+        city: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Vec<Organization>> {
+        // Escape LIKE metacharacters for safe pattern matching
+        let name_pattern = format!("%{}%", Self::escape_like(&name.to_lowercase()));
+
+        // Build query with optional city/state filters (use positional ? for simplicity)
+        let mut sql =
+            String::from("SELECT * FROM organizations WHERE LOWER(name) LIKE ? ESCAPE '\\'");
+        let mut params: Vec<String> = vec![name_pattern];
+
+        if let Some(c) = city {
+            sql.push_str(" AND LOWER(city) = ?");
+            params.push(c.to_lowercase());
+        }
+        if let Some(s) = state {
+            sql.push_str(" AND LOWER(state) = ?");
+            params.push(s.to_lowercase());
+        }
+
+        sql.push_str(" ORDER BY name");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let orgs = stmt
+            .query_map(rusqlite::params_from_iter(param_refs), Self::row_to_organization)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(orgs)
     }
 
     pub fn insert_person_organization(&self, po: &PersonOrganization) -> Result<()> {
@@ -1132,6 +1663,262 @@ impl Database {
             params![person_id.to_string()],
         )?;
         Ok(())
+    }
+
+    // ==================== TASK CRUD ====================
+
+    /// Insert a new task
+    pub fn insert_task(&self, task: &Task) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO tasks (
+                id, title, description, quadrant, deadline, completed_at,
+                person_id, parent_id, privacy_level, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            params![
+                task.id.to_string(),
+                task.title,
+                task.description,
+                task.quadrant as i32,
+                task.deadline.map(|d| d.to_rfc3339()),
+                task.completed_at.map(|d| d.to_rfc3339()),
+                task.person_id.map(|id| id.to_string()),
+                task.parent_id.map(|id| id.to_string()),
+                task.privacy_level.as_str(),
+                task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a task by ID
+    pub fn get_task_by_id(&self, id: Uuid) -> Result<Option<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE id = ?",
+        )?;
+
+        let result = stmt.query_row([id.to_string()], Self::row_to_task);
+
+        match result {
+            Ok(task) => Ok(Some(task)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all tasks, optionally including completed ones
+    pub fn list_tasks(&self, include_completed: bool) -> Result<Vec<Task>> {
+        let sql = if include_completed {
+            "SELECT * FROM tasks ORDER BY quadrant ASC, deadline ASC NULLS LAST, created_at ASC"
+        } else {
+            "SELECT * FROM tasks WHERE completed_at IS NULL ORDER BY quadrant ASC, deadline ASC NULLS LAST, created_at ASC"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let tasks = stmt
+            .query_map([], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tasks)
+    }
+
+    /// List tasks grouped by quadrant
+    /// Returns a vec of (quadrant, tasks) tuples, only for quadrants that have tasks
+    pub fn list_tasks_by_quadrant(&self, include_completed: bool) -> Result<Vec<(u8, Vec<Task>)>> {
+        let tasks = self.list_tasks(include_completed)?;
+
+        let mut groups: std::collections::HashMap<u8, Vec<Task>> = std::collections::HashMap::new();
+        for task in tasks {
+            groups.entry(task.quadrant).or_default().push(task);
+        }
+
+        // Return in quadrant order (1, 2, 3, 4)
+        let mut result = Vec::new();
+        for q in 1..=4 {
+            if let Some(tasks) = groups.remove(&q) {
+                result.push((q, tasks));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// List tasks sorted by deadline
+    pub fn list_tasks_by_deadline(&self, include_completed: bool) -> Result<Vec<Task>> {
+        let sql = if include_completed {
+            "SELECT * FROM tasks ORDER BY deadline ASC NULLS LAST, quadrant ASC, created_at ASC"
+        } else {
+            "SELECT * FROM tasks WHERE completed_at IS NULL ORDER BY deadline ASC NULLS LAST, quadrant ASC, created_at ASC"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let tasks = stmt
+            .query_map([], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tasks)
+    }
+
+    /// Get tasks linked to a specific person
+    pub fn get_tasks_for_person(&self, person_id: Uuid) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE person_id = ? ORDER BY quadrant ASC, deadline ASC NULLS LAST",
+        )?;
+
+        let tasks = stmt
+            .query_map([person_id.to_string()], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tasks)
+    }
+
+    /// Update an existing task
+    pub fn update_task(&self, task: &Task) -> Result<()> {
+        let now = Utc::now();
+        self.conn.execute(
+            r#"UPDATE tasks SET
+                title = ?, description = ?, quadrant = ?, deadline = ?,
+                completed_at = ?, person_id = ?, parent_id = ?,
+                privacy_level = ?, updated_at = ?
+            WHERE id = ?"#,
+            params![
+                task.title,
+                task.description,
+                task.quadrant as i32,
+                task.deadline.map(|d| d.to_rfc3339()),
+                task.completed_at.map(|d| d.to_rfc3339()),
+                task.person_id.map(|id| id.to_string()),
+                task.parent_id.map(|id| id.to_string()),
+                task.privacy_level.as_str(),
+                now.to_rfc3339(),
+                task.id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a task by ID
+    pub fn delete_task(&self, id: Uuid) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM tasks WHERE id = ?", [id.to_string()])?;
+        Ok(rows > 0)
+    }
+
+    /// Mark a task as completed
+    pub fn complete_task(&self, id: Uuid) -> Result<bool> {
+        let now = Utc::now();
+        let rows = self.conn.execute(
+            "UPDATE tasks SET completed_at = ?, updated_at = ? WHERE id = ?",
+            params![now.to_rfc3339(), now.to_rfc3339(), id.to_string()],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Mark a task as not completed
+    pub fn uncomplete_task(&self, id: Uuid) -> Result<bool> {
+        let now = Utc::now();
+        let rows = self.conn.execute(
+            "UPDATE tasks SET completed_at = NULL, updated_at = ? WHERE id = ?",
+            params![now.to_rfc3339(), id.to_string()],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Count pending tasks (not completed)
+    pub fn count_pending_tasks(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE completed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count completed tasks
+    pub fn count_completed_tasks(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE completed_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count pending tasks for a specific person
+    pub fn count_pending_tasks_for_person(&self, person_id: Uuid) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE person_id = ? AND completed_at IS NULL",
+            [person_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get pending tasks not linked to any person (for linking to contacts)
+    pub fn get_unlinked_pending_tasks(&self) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE person_id IS NULL AND completed_at IS NULL ORDER BY quadrant ASC, created_at DESC",
+        )?;
+
+        let tasks = stmt
+            .query_map([], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tasks)
+    }
+
+    /// Get pending tasks for a person (limited, for preview display)
+    pub fn get_pending_tasks_for_person(&self, person_id: Uuid, limit: u32) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE person_id = ? AND completed_at IS NULL ORDER BY quadrant ASC, deadline ASC NULLS LAST LIMIT ?",
+        )?;
+
+        let tasks = stmt
+            .query_map(params![person_id.to_string(), limit], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(tasks)
+    }
+
+    fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
+        let id: String = row.get("id")?;
+        let quadrant: i32 = row.get("quadrant")?;
+        let deadline: Option<String> = row.get("deadline")?;
+        let completed_at: Option<String> = row.get("completed_at")?;
+        let person_id: Option<String> = row.get("person_id")?;
+        let parent_id: Option<String> = row.get("parent_id")?;
+        let privacy_level: String = row.get("privacy_level")?;
+        let created_at: String = row.get("created_at")?;
+        let updated_at: String = row.get("updated_at")?;
+
+        Ok(Task {
+            id: parse_uuid(&id)?,
+            title: row.get("title")?,
+            description: row.get("description")?,
+            quadrant: quadrant as u8,
+            deadline: deadline.and_then(|d| {
+                chrono::DateTime::parse_from_rfc3339(&d)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            completed_at: completed_at.and_then(|d| {
+                chrono::DateTime::parse_from_rfc3339(&d)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            person_id: person_id.and_then(|s| Uuid::parse_str(&s).ok()),
+            parent_id: parent_id.and_then(|s| Uuid::parse_str(&s).ok()),
+            privacy_level: PrivacyLevel::parse(&privacy_level),
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
     }
 
     // ==================== EXTERNAL ID LOOKUPS ====================
@@ -1261,6 +2048,72 @@ mod tests {
         // Not found
         let not_found = db.get_person_by_email("nobody@example.com").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_get_person_by_phone() {
+        let db = Database::open_memory().unwrap();
+
+        let mut person = Person::new();
+        person.name_given = Some("Bob".to_string());
+        person.compute_names();
+        db.insert_person(&person).unwrap();
+
+        let phone = Phone::new(person.id, "+1 (555) 123-4567".to_string());
+        db.insert_phone(&phone).unwrap();
+
+        // Find by exact phone
+        let found = db.get_person_by_phone("+1 (555) 123-4567").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, person.id);
+
+        // Find by normalized phone (different formatting, same number)
+        let found = db.get_person_by_phone("+15551234567").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, person.id);
+
+        // Find with dashes and spaces
+        let found = db.get_person_by_phone("+1-555-123-4567").unwrap();
+        assert!(found.is_some());
+
+        // Without + prefix doesn't match +1... (different international format)
+        let not_found = db.get_person_by_phone("15551234567").unwrap();
+        assert!(not_found.is_none());
+
+        // Not found - different number
+        let not_found = db.get_person_by_phone("+19999999999").unwrap();
+        assert!(not_found.is_none());
+
+        // Empty/short phone returns None (guard against false matches)
+        let not_found = db.get_person_by_phone("").unwrap();
+        assert!(not_found.is_none());
+        let not_found = db.get_person_by_phone("123").unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_ai_contact_allowed_flag() {
+        let db = Database::open_memory().unwrap();
+
+        // New person defaults to ai_contact_allowed = true
+        let mut person = Person::new();
+        person.name_given = Some("Charlie".to_string());
+        person.compute_names();
+        assert!(person.ai_contact_allowed);
+        db.insert_person(&person).unwrap();
+
+        // Verify it's stored correctly
+        let loaded = db.get_person_by_id(person.id).unwrap().unwrap();
+        assert!(loaded.ai_contact_allowed);
+
+        // Update to disable AI contact
+        let mut updated = loaded.clone();
+        updated.ai_contact_allowed = false;
+        db.update_person(&updated).unwrap();
+
+        // Verify the update persisted
+        let reloaded = db.get_person_by_id(person.id).unwrap().unwrap();
+        assert!(!reloaded.ai_contact_allowed);
     }
 
     #[test]
@@ -1509,5 +2362,327 @@ mod tests {
         let addresses = db.get_addresses_for_person(person.id).unwrap();
         let primary_count = addresses.iter().filter(|a| a.is_primary).count();
         assert_eq!(primary_count, 1);
+    }
+
+    #[test]
+    fn test_task_crud() {
+        let db = Database::open_memory().unwrap();
+
+        // Create
+        let mut task = Task::new("Buy groceries".to_string());
+        task.quadrant = 2;
+        task.description = Some("Get milk and bread".to_string());
+        db.insert_task(&task).unwrap();
+
+        // Read
+        let retrieved = db.get_task_by_id(task.id).unwrap().unwrap();
+        assert_eq!(retrieved.title, "Buy groceries");
+        assert_eq!(retrieved.quadrant, 2);
+        assert_eq!(retrieved.description, Some("Get milk and bread".to_string()));
+        assert!(!retrieved.is_completed());
+
+        // Update
+        let mut updated = retrieved.clone();
+        updated.title = "Buy food".to_string();
+        updated.quadrant = 1;
+        db.update_task(&updated).unwrap();
+
+        let retrieved = db.get_task_by_id(task.id).unwrap().unwrap();
+        assert_eq!(retrieved.title, "Buy food");
+        assert_eq!(retrieved.quadrant, 1);
+
+        // Complete
+        db.complete_task(task.id).unwrap();
+        let retrieved = db.get_task_by_id(task.id).unwrap().unwrap();
+        assert!(retrieved.is_completed());
+
+        // Uncomplete
+        db.uncomplete_task(task.id).unwrap();
+        let retrieved = db.get_task_by_id(task.id).unwrap().unwrap();
+        assert!(!retrieved.is_completed());
+
+        // Delete
+        assert!(db.delete_task(task.id).unwrap());
+        assert!(db.get_task_by_id(task.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_task_list_and_count() {
+        let db = Database::open_memory().unwrap();
+
+        // Create tasks in different quadrants
+        let mut task1 = Task::new("Q1 task".to_string());
+        task1.quadrant = 1;
+        db.insert_task(&task1).unwrap();
+
+        let mut task2 = Task::new("Q2 task".to_string());
+        task2.quadrant = 2;
+        db.insert_task(&task2).unwrap();
+
+        let mut task3 = Task::new("Q4 task".to_string());
+        task3.quadrant = 4;
+        db.insert_task(&task3).unwrap();
+
+        // Count
+        assert_eq!(db.count_pending_tasks().unwrap(), 3);
+        assert_eq!(db.count_completed_tasks().unwrap(), 0);
+
+        // List all
+        let tasks = db.list_tasks(false).unwrap();
+        assert_eq!(tasks.len(), 3);
+        // Should be sorted by quadrant
+        assert_eq!(tasks[0].quadrant, 1);
+        assert_eq!(tasks[1].quadrant, 2);
+        assert_eq!(tasks[2].quadrant, 4);
+
+        // Complete one
+        db.complete_task(task2.id).unwrap();
+        assert_eq!(db.count_pending_tasks().unwrap(), 2);
+        assert_eq!(db.count_completed_tasks().unwrap(), 1);
+
+        // List excluding completed
+        let tasks = db.list_tasks(false).unwrap();
+        assert_eq!(tasks.len(), 2);
+
+        // List including completed
+        let tasks = db.list_tasks(true).unwrap();
+        assert_eq!(tasks.len(), 3);
+    }
+
+    #[test]
+    fn test_task_with_person() {
+        let db = Database::open_memory().unwrap();
+
+        // Create a person
+        let mut person = Person::new();
+        person.name_given = Some("Alice".to_string());
+        person.compute_names();
+        db.insert_person(&person).unwrap();
+
+        // Create a task linked to the person
+        let mut task = Task::new("Call Alice".to_string());
+        task.person_id = Some(person.id);
+        db.insert_task(&task).unwrap();
+
+        // Get tasks for person
+        let tasks = db.get_tasks_for_person(person.id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Call Alice");
+
+        // Delete person should set task's person_id to NULL (SET NULL)
+        db.delete_person(person.id).unwrap();
+        let retrieved = db.get_task_by_id(task.id).unwrap().unwrap();
+        assert!(retrieved.person_id.is_none());
+    }
+
+    #[test]
+    fn test_count_pending_tasks_for_person() {
+        let db = Database::open_memory().unwrap();
+
+        // Create two persons
+        let mut alice = Person::new();
+        alice.name_given = Some("Alice".to_string());
+        alice.compute_names();
+        db.insert_person(&alice).unwrap();
+
+        let mut bob = Person::new();
+        bob.name_given = Some("Bob".to_string());
+        bob.compute_names();
+        db.insert_person(&bob).unwrap();
+
+        // No tasks yet
+        assert_eq!(db.count_pending_tasks_for_person(alice.id).unwrap(), 0);
+        assert_eq!(db.count_pending_tasks_for_person(bob.id).unwrap(), 0);
+
+        // Create tasks for Alice
+        let mut task1 = Task::new("Call Alice".to_string());
+        task1.person_id = Some(alice.id);
+        db.insert_task(&task1).unwrap();
+
+        let mut task2 = Task::new("Email Alice".to_string());
+        task2.person_id = Some(alice.id);
+        db.insert_task(&task2).unwrap();
+
+        // Create task for Bob
+        let mut task3 = Task::new("Meet Bob".to_string());
+        task3.person_id = Some(bob.id);
+        db.insert_task(&task3).unwrap();
+
+        // Verify counts
+        assert_eq!(db.count_pending_tasks_for_person(alice.id).unwrap(), 2);
+        assert_eq!(db.count_pending_tasks_for_person(bob.id).unwrap(), 1);
+
+        // Complete one of Alice's tasks
+        db.complete_task(task1.id).unwrap();
+        assert_eq!(db.count_pending_tasks_for_person(alice.id).unwrap(), 1);
+
+        // Complete all Alice's tasks
+        db.complete_task(task2.id).unwrap();
+        assert_eq!(db.count_pending_tasks_for_person(alice.id).unwrap(), 0);
+
+        // Bob's count unchanged
+        assert_eq!(db.count_pending_tasks_for_person(bob.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_unlinked_pending_tasks() {
+        let db = Database::open_memory().unwrap();
+
+        // Create a person
+        let mut person = Person::new();
+        person.name_given = Some("Alice".to_string());
+        person.compute_names();
+        db.insert_person(&person).unwrap();
+
+        // Create linked task
+        let mut linked = Task::new("Linked task".to_string());
+        linked.person_id = Some(person.id);
+        db.insert_task(&linked).unwrap();
+
+        // Create unlinked tasks
+        let unlinked1 = Task::new("Unlinked 1".to_string());
+        db.insert_task(&unlinked1).unwrap();
+
+        let unlinked2 = Task::new("Unlinked 2".to_string());
+        db.insert_task(&unlinked2).unwrap();
+
+        // Create completed unlinked task (should not appear)
+        let mut completed = Task::new("Completed unlinked".to_string());
+        db.insert_task(&completed).unwrap();
+        db.complete_task(completed.id).unwrap();
+
+        // Should return only pending unlinked tasks
+        let unlinked = db.get_unlinked_pending_tasks().unwrap();
+        assert_eq!(unlinked.len(), 2);
+        assert!(unlinked.iter().all(|t| t.person_id.is_none()));
+        assert!(unlinked.iter().all(|t| !t.is_completed()));
+    }
+
+    #[test]
+    fn test_get_pending_tasks_for_person_with_limit() {
+        let db = Database::open_memory().unwrap();
+
+        let mut person = Person::new();
+        person.name_given = Some("Bob".to_string());
+        person.compute_names();
+        db.insert_person(&person).unwrap();
+
+        // Create 5 tasks for Bob
+        for i in 1..=5 {
+            let mut task = Task::new(format!("Task {}", i));
+            task.person_id = Some(person.id);
+            task.quadrant = (i % 4 + 1) as u8;
+            db.insert_task(&task).unwrap();
+        }
+
+        // Complete one task
+        let tasks = db.get_tasks_for_person(person.id).unwrap();
+        db.complete_task(tasks[0].id).unwrap();
+
+        // Get with limit 2
+        let limited = db.get_pending_tasks_for_person(person.id, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+
+        // Get with limit higher than available
+        let all_pending = db.get_pending_tasks_for_person(person.id, 100).unwrap();
+        assert_eq!(all_pending.len(), 4); // 5 - 1 completed
+    }
+
+    #[test]
+    fn test_search_organizations_by_name() {
+        let db = Database::open_memory().unwrap();
+
+        // Create organizations
+        let mut org1 = Organization::new("Acme Corp".to_string());
+        org1.city = Some("Seattle".to_string());
+        org1.state = Some("WA".to_string());
+        db.insert_organization(&org1).unwrap();
+
+        let mut org2 = Organization::new("Acme Industries".to_string());
+        org2.city = Some("Portland".to_string());
+        org2.state = Some("OR".to_string());
+        db.insert_organization(&org2).unwrap();
+
+        let mut org3 = Organization::new("Beta Inc".to_string());
+        org3.city = Some("Seattle".to_string());
+        org3.state = Some("WA".to_string());
+        db.insert_organization(&org3).unwrap();
+
+        // Case-insensitive search by name
+        let results = db.search_organizations_by_name("acme", None, None).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = db.search_organizations_by_name("ACME", None, None).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = db.search_organizations_by_name("AcMe", None, None).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Partial match
+        let results = db.search_organizations_by_name("corp", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Acme Corp");
+
+        // No match returns empty vec
+        let results = db.search_organizations_by_name("nonexistent", None, None).unwrap();
+        assert!(results.is_empty());
+
+        // Filter by city
+        let results = db.search_organizations_by_name("acme", Some("Seattle"), None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Acme Corp");
+
+        // Filter by state
+        let results = db.search_organizations_by_name("acme", None, Some("OR")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Acme Industries");
+
+        // Filter by city and state
+        let results = db.search_organizations_by_name("acme", Some("Seattle"), Some("WA")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Acme Corp");
+
+        // City/state filter is also case-insensitive
+        let results = db.search_organizations_by_name("acme", Some("seattle"), Some("wa")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Acme Corp");
+    }
+
+    #[test]
+    fn test_search_organizations_escapes_like_metacharacters() {
+        let db = Database::open_memory().unwrap();
+
+        // Create organizations with special characters in names
+        let org1 = Organization::new("100% Natural Foods".to_string());
+        db.insert_organization(&org1).unwrap();
+
+        let org2 = Organization::new("Under_score Corp".to_string());
+        db.insert_organization(&org2).unwrap();
+
+        let org3 = Organization::new("Back\\slash Inc".to_string());
+        db.insert_organization(&org3).unwrap();
+
+        let org4 = Organization::new("Normal Company".to_string());
+        db.insert_organization(&org4).unwrap();
+
+        // Search for literal % should only match "100% Natural Foods"
+        let results = db.search_organizations_by_name("100%", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "100% Natural Foods");
+
+        // Search for literal _ should only match "Under_score Corp"
+        let results = db.search_organizations_by_name("_score", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Under_score Corp");
+
+        // Search for literal \ should only match "Back\slash Inc"
+        let results = db.search_organizations_by_name("\\slash", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Back\\slash Inc");
+
+        // Regular search still works
+        let results = db.search_organizations_by_name("normal", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Normal Company");
     }
 }

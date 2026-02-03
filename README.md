@@ -82,6 +82,39 @@ contactcmd sync mac                 # Import from macOS Contacts
 contactcmd sync mac --dry-run       # Preview without importing
 ```
 
+### gateway
+```bash
+contactcmd gateway start            # Start gateway server (port 9810)
+contactcmd gateway stop             # Stop gateway server
+contactcmd gateway status           # Show status + pending count
+contactcmd gateway approve          # TUI for reviewing queued messages
+
+contactcmd gateway keys add "Agent" # Generate API key for an agent
+contactcmd gateway keys list        # List all API keys
+contactcmd gateway keys revoke <id> # Revoke an API key
+```
+
+## AI Agent Gateway
+
+The gateway provides human-in-the-loop approval for AI-initiated messages, preventing agents from impersonating you to trusted contacts.
+
+```
+AI Agent ──► Gateway API ──► Approval Queue ──► Human Review ──► Send
+```
+
+**Setup:**
+1. Start the gateway: `contactcmd gateway start --foreground`
+2. Generate an API key: `contactcmd gateway keys add "My AI Agent"`
+3. Configure your agent with the gateway URL and API key
+4. Review queued messages: `contactcmd gateway approve` (or select "Gateway" from main menu)
+
+**API Endpoints:**
+- `POST /gateway/send` - Queue a message (requires API key)
+- `GET /gateway/actions/{id}` - Poll message status
+- `GET /gateway/health` - Health check
+
+See [Gateway docs](docs/features/gateway.md) for full API reference.
+
 ## macOS Contacts Sync
 
 Import your contacts from the macOS Contacts app:
@@ -120,7 +153,7 @@ SQLite database at `~/.config/contactcmd/contacts.db`
 | Feature | Status |
 |---------|--------|
 | Project setup | Complete |
-| Database schema | Complete |
+| Database schema (V7) | Complete |
 | Models & CRUD | Complete |
 | list command | Complete |
 | search command | Complete |
@@ -128,12 +161,15 @@ SQLite database at `~/.config/contactcmd/contacts.db`
 | add command | Complete |
 | messages command | Complete |
 | macOS sync | Complete |
+| Gateway (AI approval queue) | Complete |
+| Email sending (Gmail) | Complete |
+| SMS/iMessage sending | Complete |
 
 ## Development
 
 ```bash
 cargo build          # Build
-cargo test           # Run tests (76 tests)
+cargo test           # Run tests (171 tests)
 cargo run -- --help  # Run in development
 ```
 

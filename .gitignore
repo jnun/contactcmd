@@ -1,3 +1,6 @@
+# Avoid temp files
+tmp/
+
 # Rust/Cargo
 target/
 **/*.rs.bk
