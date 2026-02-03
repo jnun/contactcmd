@@ -1,0 +1,252 @@
+# Build and release ContactCMD for Intel and Apple Silicon Macs
+#
+# Triggers on version tags (v*) and creates a GitHub Release with:
+#   - contactcmd-VERSION-intel.dmg     (Intel Macs)
+#   - contactcmd-VERSION-arm64.dmg     (Apple Silicon Macs)
+#   - contactcmd-VERSION-universal.dmg (All Macs)
+#   - checksums.txt
+#
+# Usage:
+#   git tag v0.2.0
+#   git push origin --tags
+
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g., v0.2.0)'
+        required: true
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: intel
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p release dmg-staging
+
+          # Copy binary and create install instructions
+          cp "target/${{ matrix.target }}/release/contactcmd" dmg-staging/
+
+          cat > dmg-staging/INSTALL.txt << 'EOF'
+          ContactCMD Installation
+          =======================
+
+          To install ContactCMD, copy the binary to a directory in your PATH.
+
+          Quick install (recommended):
+
+              mkdir -p ~/.local/bin
+              cp contactcmd ~/.local/bin/
+              export PATH="$HOME/.local/bin:$PATH"
+
+          Alternative: Install to /usr/local/bin (requires sudo):
+
+              sudo cp contactcmd /usr/local/bin/
+
+          Verify installation:
+
+              contactcmd --version
+          EOF
+
+          create-dmg \
+            --volname "ContactCMD $VERSION (${{ matrix.artifact }})" \
+            --window-pos 200 120 \
+            --window-size 500 350 \
+            --icon-size 80 \
+            --hide-extension "contactcmd" \
+            --no-internet-enable \
+            "release/contactcmd-$VERSION-${{ matrix.artifact }}.dmg" \
+            "dmg-staging/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contactcmd-${{ matrix.artifact }}
+          path: release/*.dmg
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/contactcmd
+
+  create-universal:
+    needs: build-macos
+    runs-on: macos-14
+
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - name: Create universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            binaries/binary-intel/contactcmd \
+            binaries/binary-arm64/contactcmd \
+            -output universal/contactcmd
+
+          # Verify
+          echo "Universal binary architectures:"
+          lipo -archs universal/contactcmd
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Create universal DMG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p release dmg-staging
+
+          cp universal/contactcmd dmg-staging/
+
+          cat > dmg-staging/INSTALL.txt << 'EOF'
+          ContactCMD Installation (Universal Binary)
+          ==========================================
+
+          This binary runs natively on both Intel and Apple Silicon Macs.
+
+          Quick install (recommended):
+
+              mkdir -p ~/.local/bin
+              cp contactcmd ~/.local/bin/
+              export PATH="$HOME/.local/bin:$PATH"
+
+          Alternative: Install to /usr/local/bin (requires sudo):
+
+              sudo cp contactcmd /usr/local/bin/
+
+          Verify installation:
+
+              contactcmd --version
+          EOF
+
+          create-dmg \
+            --volname "ContactCMD $VERSION (Universal)" \
+            --window-pos 200 120 \
+            --window-size 500 350 \
+            --icon-size 80 \
+            --hide-extension "contactcmd" \
+            --no-internet-enable \
+            "release/contactcmd-$VERSION-universal.dmg" \
+            "dmg-staging/"
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contactcmd-universal
+          path: release/*.dmg
+
+  create-release:
+    needs: [build-macos, create-universal]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: contactcmd-*
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -name "*.dmg" -exec mv {} release/ \;
+          cd release
+          shasum -a 256 *.dmg > checksums.txt
+          echo "Release files:"
+          ls -la
+          echo ""
+          echo "Checksums:"
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ContactCMD ${{ steps.version.outputs.version }}
+          files: |
+            release/*.dmg
+            release/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

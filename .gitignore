@@ -116,6 +116,11 @@ photos/
 !docs/**/*.png
 !docs/**/*.jpg
 
+# Release artifacts
+release/
+.release-staging/
+*.dmg
+
 # Design files (binary/large files)
 docs/designs/*.psd
 docs/designs/*.ai

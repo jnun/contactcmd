@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self';">
+    <meta name="referrer" content="no-referrer">
+    <title>ContactCMD - AI-Assisted Personal CRM for the Terminal</title>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --accent-glow: rgba(88, 166, 255, 0.3);
+            --green: #3fb950;
+            --purple: #a371f7;
+            --orange: #d29922;
+            --border: #30363d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* Header */
+        header {
+            padding: 24px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+
+        .logo span {
+            color: var(--accent);
+        }
+
+        .download-btn {
+            background: var(--accent);
+            color: var(--bg-dark);
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        .download-btn:hover {
+            box-shadow: 0 0 20px var(--accent-glow);
+            transform: translateY(-2px);
+        }
+
+        /* Hero */
+        .hero {
+            padding: 80px 0;
+            text-align: center;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero .tagline {
+            font-size: 1.5rem;
+            color: var(--text-secondary);
+            max-width: 700px;
+            margin: 0 auto 16px;
+        }
+
+        .hero .subtitle {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto 40px;
+        }
+
+        .platform-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-top: 16px;
+        }
+
+        .platform-badge svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Terminal Preview */
+        .terminal-section {
+            padding: 40px 0 80px;
+        }
+
+        .terminal {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        .terminal-header {
+            background: #21262d;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-dot.red { background: #ff5f56; }
+        .terminal-dot.yellow { background: #ffbd2e; }
+        .terminal-dot.green { background: #27c93f; }
+
+        .terminal-title {
+            flex: 1;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .terminal-body {
+            padding: 24px;
+            font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.9rem;
+            line-height: 1.8;
+        }
+
+        .terminal-line {
+            margin-bottom: 8px;
+        }
+
+        .prompt {
+            color: var(--green);
+        }
+
+        .command {
+            color: var(--text-primary);
+        }
+
+        .output {
+            color: var(--text-secondary);
+        }
+
+        .highlight {
+            color: var(--accent);
+        }
+
+        .dim {
+            color: #484f58;
+        }
+
+        /* Features */
+        .features {
+            padding: 80px 0;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 16px;
+        }
+
+        .section-subtitle {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto 60px;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 24px;
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-4px);
+        }
+
+        .feature-icon {
+            width: 48px;
+            height: 48px;
+            background: rgba(88, 166, 255, 0.1);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+        }
+
+        .feature-card h3 {
+            font-size: 1.25rem;
+            margin-bottom: 12px;
+        }
+
+        .feature-card p {
+            color: var(--text-secondary);
+        }
+
+        /* Gateway Section */
+        .gateway {
+            padding: 80px 0;
+            background: linear-gradient(180deg, transparent 0%, rgba(88, 166, 255, 0.05) 50%, transparent 100%);
+        }
+
+        .gateway-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 60px;
+            align-items: center;
+        }
+
+        .gateway-text h2 {
+            font-size: 2.5rem;
+            margin-bottom: 24px;
+        }
+
+        .gateway-text h2 span {
+            color: var(--purple);
+        }
+
+        .gateway-text p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            margin-bottom: 20px;
+        }
+
+        .gateway-flow {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+        }
+
+        .flow-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .flow-step:last-child {
+            margin-bottom: 0;
+        }
+
+        .flow-number {
+            width: 32px;
+            height: 32px;
+            background: var(--purple);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.9rem;
+            flex-shrink: 0;
+        }
+
+        .flow-content h4 {
+            font-size: 1rem;
+            margin-bottom: 4px;
+        }
+
+        .flow-content p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .flow-arrow {
+            width: 2px;
+            height: 20px;
+            background: var(--border);
+            margin-left: 15px;
+            margin-bottom: 8px;
+        }
+
+        /* Screenshots */
+        .screenshots {
+            padding: 80px 0;
+        }
+
+        .screenshot-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 24px;
+        }
+
+        .screenshot-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .screenshot-terminal {
+            background: #0d1117;
+            padding: 20px;
+            font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.75rem;
+            line-height: 1.6;
+            min-height: 260px;
+            overflow: hidden;
+        }
+
+        .screenshot-terminal .term-line {
+            white-space: nowrap;
+            overflow: hidden;
+        }
+
+        .screenshot-terminal .selected {
+            background: #21262d;
+            margin: 0 -20px;
+            padding: 0 20px;
+        }
+
+        .screenshot-caption {
+            padding: 20px;
+            border-top: 1px solid var(--border);
+        }
+
+        .screenshot-caption h4 {
+            font-size: 1rem;
+            margin-bottom: 8px;
+        }
+
+        .screenshot-caption p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        /* CTA */
+        .cta {
+            padding: 100px 0;
+            text-align: center;
+        }
+
+        .cta h2 {
+            font-size: 2.5rem;
+            margin-bottom: 16px;
+        }
+
+        .cta p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            margin-bottom: 32px;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-dark);
+            padding: 16px 32px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1rem;
+            transition: all 0.2s;
+        }
+
+        .btn-primary:hover {
+            box-shadow: 0 0 30px var(--accent-glow);
+            transform: translateY(-2px);
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 40px 0;
+            text-align: center;
+        }
+
+        footer p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+
+            .hero .tagline {
+                font-size: 1.2rem;
+            }
+
+            .gateway-content {
+                grid-template-columns: 1fr;
+            }
+
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .screenshot-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .terminal-body {
+                font-size: 0.8rem;
+                padding: 16px;
+            }
+
+            .screenshot-terminal {
+                font-size: 0.65rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container header-content">
+            <a href="#" class="logo">contact<span>CMD</span></a>
+            <a href="downloads/contactcmd-0.1.0-arm64.dmg" class="download-btn" download>Download for Mac</a>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="container">
+                <h1>Your Contacts, Your Terminal</h1>
+                <p class="tagline">A blazing-fast personal CRM with AI-assisted communication</p>
+                <p class="subtitle">Manage contacts, sync with macOS, search iMessage history, and safely let AI agents communicate on your behalf &mdash; all from the command line.</p>
+                <a href="downloads/contactcmd-0.1.0-arm64.dmg" class="download-btn">Download Free</a>
+                <div class="platform-badge">
+                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+                    Apple Silicon (macOS 12+)
+                </div>
+            </div>
+        </section>
+
+        <section class="terminal-section">
+            <div class="container">
+                <div class="terminal">
+                    <div class="terminal-header">
+                        <div class="terminal-dot red"></div>
+                        <div class="terminal-dot yellow"></div>
+                        <div class="terminal-dot green"></div>
+                        <span class="terminal-title">contactcmd &mdash; zsh</span>
+                    </div>
+                    <div class="terminal-body">
+                        <div class="terminal-line"><span class="prompt">$</span> <span class="command">contactcmd search "john designer"</span></div>
+                        <div class="terminal-line output">Found <span class="highlight">3</span> contacts:</div>
+                        <div class="terminal-line output">&nbsp;&nbsp;<span class="highlight">John Martinez</span> &mdash; Senior Designer @ Figma</div>
+                        <div class="terminal-line output">&nbsp;&nbsp;<span class="highlight">Johnny Chen</span> &mdash; UX Designer @ Stripe</div>
+                        <div class="terminal-line output">&nbsp;&nbsp;<span class="highlight">John-Paul Rivera</span> &mdash; Product Designer</div>
+                        <div class="terminal-line">&nbsp;</div>
+                        <div class="terminal-line"><span class="prompt">$</span> <span class="command">contactcmd show "john martinez"</span></div>
+                        <div class="terminal-line output">
+<pre style="margin:0;color:var(--text-secondary)">
+  <span class="highlight">John Martinez</span>
+  Senior Designer @ Figma
+
+  <span class="dim">Email:</span>    john.m@figma.com
+  <span class="dim">Phone:</span>    +1 (415) 555-0123
+  <span class="dim">Tags:</span>     #design #hiring #met-at-config
+  <span class="dim">Last:</span>     Grabbed coffee, Jan 15
+</pre>
+                        </div>
+                        <div class="terminal-line">&nbsp;</div>
+                        <div class="terminal-line"><span class="prompt">$</span> <span class="command">contactcmd chat</span></div>
+                        <div class="terminal-line output"><span class="highlight">AI:</span> How can I help you with your contacts today?</div>
+                        <div class="terminal-line"><span class="dim">You:</span> <span class="command">Who should I follow up with this week?</span></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="features">
+            <div class="container">
+                <h2 class="section-title">Everything You Need</h2>
+                <p class="section-subtitle">A complete contact management system designed for developers and power users who live in the terminal.</p>
+
+                <div class="features-grid">
+                    <div class="feature-card">
+                        <div class="feature-icon">&#128269;</div>
+                        <h3>Lightning-Fast Search</h3>
+                        <p>Multi-word AND search across all fields. Find anyone in milliseconds, even with thousands of contacts. Filter by tags, organizations, or missing data.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">&#128257;</div>
+                        <h3>macOS Contacts Sync</h3>
+                        <p>Bidirectional sync with your Mac's Contacts app. Import your existing contacts or keep them in perfect sync. Your data stays local.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">&#128172;</div>
+                        <h3>iMessage History</h3>
+                        <p>Search and browse your full iMessage and SMS history. See conversation context right alongside contact details. Never lose track of past discussions.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">&#129302;</div>
+                        <h3>AI Chat Interface</h3>
+                        <p>Natural language queries for your contacts. Ask questions like "Who do I know at Google?" or "Find designers I met last month." Get instant, intelligent answers.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">&#127991;</div>
+                        <h3>Smart Tags & Tasks</h3>
+                        <p>Organize contacts with flexible tags. Set follow-up reminders and check-ins. Never let important relationships go cold.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">&#128640;</div>
+                        <h3>Built in Rust</h3>
+                        <p>Zero-dependency single binary. Sub-100ms operations. Offline-first with local SQLite storage. Fast, reliable, and respects your privacy.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="gateway">
+            <div class="container">
+                <div class="gateway-content">
+                    <div class="gateway-text">
+                        <h2>The <span>Agent Gateway</span></h2>
+                        <p>Let AI agents draft messages to your contacts &mdash; but <strong>you</strong> decide what actually gets sent.</p>
+                        <p>The Gateway is a human-in-the-loop approval system that prevents AI from impersonating you. Agents queue messages via API, and you review every single one before it goes out.</p>
+                        <p>Perfect for automation workflows, AI assistants, and anyone who wants AI help without giving up control.</p>
+                    </div>
+                    <div class="gateway-flow">
+                        <div class="flow-step">
+                            <div class="flow-number">1</div>
+                            <div class="flow-content">
+                                <h4>Agent Queues Message</h4>
+                                <p>AI agents submit email, SMS, or iMessage drafts via secure HTTP API</p>
+                            </div>
+                        </div>
+                        <div class="flow-arrow"></div>
+                        <div class="flow-step">
+                            <div class="flow-number">2</div>
+                            <div class="flow-content">
+                                <h4>Review in contactCMD</h4>
+                                <p>Messages appear in your approval queue with full context</p>
+                            </div>
+                        </div>
+                        <div class="flow-arrow"></div>
+                        <div class="flow-step">
+                            <div class="flow-number">3</div>
+                            <div class="flow-content">
+                                <h4>Approve or Deny</h4>
+                                <p>One keystroke to approve, edit, or reject each message</p>
+                            </div>
+                        </div>
+                        <div class="flow-arrow"></div>
+                        <div class="flow-step">
+                            <div class="flow-number">4</div>
+                            <div class="flow-content">
+                                <h4>Sent on Your Behalf</h4>
+                                <p>Only approved messages reach your contacts</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="screenshots">
+            <div class="container">
+                <h2 class="section-title">See It In Action</h2>
+                <p class="section-subtitle">A beautiful terminal interface that makes contact management a joy.</p>
+
+                <div class="screenshot-grid">
+                    <!-- Browse View -->
+                    <div class="screenshot-card">
+                        <div class="screenshot-terminal">
+                            <div class="term-line" style="color: var(--accent); font-weight: bold;">Sarah Chen</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  VP of Engineering at Dataflow</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Email:</span>    <span style="color: var(--text-secondary);">sarah.chen@dataflow.io</span></div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Phone:</span>    <span style="color: var(--text-secondary);">+1 (628) 555-0147</span></div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Location:</span> <span style="color: var(--text-secondary);">San Francisco, CA</span></div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Tags:</span>     <span style="color: var(--purple);">#engineering #hiring #startup</span></div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Notes:</span>    <span style="color: var(--text-secondary);">Met at DevCon 2024. Interested in...</span></div>
+                            <div class="term-line" style="color: #484f58;">  <span style="color: #484f58;">Last msg:</span> <span style="color: var(--green);">&lt;</span> <span style="color: var(--text-secondary);">Jan 28 "Looking forward to coffee..."</span></div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: #484f58; border-top: 1px solid #21262d; padding-top: 8px; margin-top: 4px;">3/127: <span style="color: var(--text-secondary);">[e]dit [m]sg [n]ote [t]ask [d]el [v]iew</span> | <span style="color: var(--text-secondary);">[?] [q]uit</span></div>
+                        </div>
+                        <div class="screenshot-caption">
+                            <h4>Visual Card Browser</h4>
+                            <p>Browse contacts with rich cards showing photos, tags, and key details at a glance.</p>
+                        </div>
+                    </div>
+
+                    <!-- AI Chat -->
+                    <div class="screenshot-card">
+                        <div class="screenshot-terminal">
+                            <div class="term-line" style="color: var(--text-primary);">contactcmd chat</div>
+                            <div class="term-line" style="color: #484f58;">───────────────</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: var(--text-secondary);">AI is enabled. Type naturally or use /commands.</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line"><span style="color: var(--green);">&gt;</span> <span style="color: var(--text-primary);">who do I know that works in AI?</span></div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: var(--text-secondary);">Found <span style="color: var(--accent);">4</span> contacts in AI-related roles:</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  1. <span style="color: var(--accent);">Marcus Webb</span> - ML Engineer @ Anthropic</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  2. <span style="color: var(--accent);">Lisa Park</span> - AI Research @ DeepMind</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  3. <span style="color: var(--accent);">David Okonkwo</span> - Head of AI @ Notion</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  4. <span style="color: var(--accent);">Amy Zhang</span> - NLP Lead @ Cohere</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: #484f58;">Tip: /browse to view these contacts</div>
+                        </div>
+                        <div class="screenshot-caption">
+                            <h4>AI-Powered Chat</h4>
+                            <p>Ask natural language questions and get intelligent answers about your network.</p>
+                        </div>
+                    </div>
+
+                    <!-- Message History -->
+                    <div class="screenshot-card">
+                        <div class="screenshot-terminal">
+                            <div class="term-line" style="color: var(--text-primary);">Messages: <span style="color: var(--accent);">Alex Rivera</span></div>
+                            <div class="term-line" style="color: var(--text-secondary);">  +1 (415) 555-0892</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line selected" style="color: var(--text-secondary);"><span style="color: var(--green);">&gt;</span> <span style="color: var(--green);">&gt;</span> Today 2:34pm   <span style="color: var(--text-primary);">"sounds good, see you at 6!"</span></div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--accent);">&lt;</span> Today 2:31pm   "want to grab dinner tonight?"</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--green);">&gt;</span> Today 11:15am  "just sent over the deck"</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--accent);">&lt;</span> Today 10:42am  "can you share the slides?"</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--green);">&gt;</span> Yesterday      "great meeting today!"</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--accent);">&lt;</span> Yesterday      "thanks for the intro to Sarah"</div>
+                            <div class="term-line" style="color: var(--text-secondary);">  <span style="color: var(--green);">&gt;</span> Jan 28         "happy to help, she's great"</div>
+                            <div class="term-line">&nbsp;</div>
+                            <div class="term-line" style="color: #484f58; border-top: 1px solid #21262d; padding-top: 8px;">1-7 of 43  <span style="color: var(--text-secondary);">[</span><span style="color:var(--accent);">&#8593;/&#8595;</span><span style="color: var(--text-secondary);">] scroll [enter] expand [q]uit</span></div>
+                        </div>
+                        <div class="screenshot-caption">
+                            <h4>iMessage Integration</h4>
+                            <p>Full conversation history at your fingertips, searchable and organized.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="cta" id="download">
+            <div class="container">
+                <h2>Ready to Take Control?</h2>
+                <p>Download ContactCMD and experience contact management the way it should be.</p>
+                <div class="cta-buttons">
+                    <a href="downloads/contactcmd-0.1.0-arm64.dmg" class="btn-primary">Download for Mac (Apple Silicon)</a>
+                </div>
+                <p style="margin-top: 24px; font-size: 0.8rem; color: var(--text-secondary);">
+                    v0.1.0 &bull; 7.9 MB &bull; SHA256: <code style="font-size: 0.75rem; background: var(--bg-card); padding: 2px 6px; border-radius: 4px;">333d34f8...48c4438</code>
+                </p>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>Built with Rust. Your data stays local.</p>
+        </div>
+    </footer>
+</body>
+</html>

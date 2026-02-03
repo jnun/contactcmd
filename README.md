@@ -102,18 +102,15 @@ The gateway provides human-in-the-loop approval for AI-initiated messages, preve
 AI Agent ──► Gateway API ──► Approval Queue ──► Human Review ──► Send
 ```
 
+**Safety features:** Rate limiting, recipient allowlists, content filters, per-contact AI consent flags.
+
 **Setup:**
-1. Start the gateway: `contactcmd gateway start --foreground`
-2. Generate an API key: `contactcmd gateway keys add "My AI Agent"`
-3. Configure your agent with the gateway URL and API key
-4. Review queued messages: `contactcmd gateway approve` (or select "Gateway" from main menu)
+1. Start the gateway: `contactcmd gateway start`
+2. Generate an API key: `contactcmd gateway keys add "my-agent"`
+3. Configure your agent with the gateway URL (`http://localhost:9810`) and API key
+4. Review queued messages: `contactcmd gateway approve`
 
-**API Endpoints:**
-- `POST /gateway/send` - Queue a message (requires API key)
-- `GET /gateway/actions/{id}` - Poll message status
-- `GET /gateway/health` - Health check
-
-See [Gateway docs](docs/features/gateway.md) for full API reference.
+**Integration guide:** [docs/guides/agent-gateway-integration.md](docs/guides/agent-gateway-integration.md) - Full API reference, error handling, Python/TypeScript examples.
 
 ## macOS Contacts Sync
 
@@ -153,7 +150,7 @@ SQLite database at `~/.config/contactcmd/contacts.db`
 | Feature | Status |
 |---------|--------|
 | Project setup | Complete |
-| Database schema (V7) | Complete |
+| Database schema (V14) | Complete |
 | Models & CRUD | Complete |
 | list command | Complete |
 | search command | Complete |
@@ -169,7 +166,7 @@ SQLite database at `~/.config/contactcmd/contacts.db`
 
 ```bash
 cargo build          # Build
-cargo test           # Run tests (171 tests)
+cargo test           # Run tests (205 tests)
 cargo run -- --help  # Run in development
 ```
 
